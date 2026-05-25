@@ -1,0 +1,136 @@
+# baseline_ships.yaml for N-OILS v3.16.
+# All values are real and matched to the model.
+# USV model not yet included.
+
+AD-37:
+  a: -535.29
+  b: 535.95
+  c: 0.79181
+  fuel_capacity_kl: 1740.0
+  speed_limit: 20.0
+AE/TAE-26:
+  a: -536.87
+  b: 537.38
+  c: 0.59405
+  fuel_capacity_kl: 160.0
+  speed_limit: 22.0
+AFS/TAFS-1:
+  a: -3.4818
+  b: 4.087
+  c: 55.512
+  fuel_capacity_kl: 130.0
+  speed_limit: 20.0
+AGF-3:
+  a: -536.03
+  b: 536.65
+  c: 0.72028
+  fuel_capacity_kl: 1392.0
+  speed_limit: 20.0
+AO-177(J):
+  a: -1.5194
+  b: 2.4665
+  c: 83.931
+  fuel_capacity_kl: 190.0
+  speed_limit: 20.0
+AOE-1:
+  a: -65.188
+  b: 65.822
+  c: 12.258
+  fuel_capacity_kl: 320.0
+  speed_limit: 20.0
+AOE-6:
+  a: -10917
+  b: 10918
+  c: 0.048411
+  fuel_capacity_kl: 400.0
+  speed_limit: 20.0
+AOR-1:
+  a: -34.02
+  b: 34.683
+  c: 16.393
+  fuel_capacity_kl: 280.0
+  speed_limit: 20.0
+CG-47/52:
+  a: -3.3807
+  b: 5.2412
+  c: 37.484
+  fuel_capacity_kl: 2900.0
+  speed_limit: 32.5
+CV-63/67:
+  a: -21.144
+  b: 25.706
+  c: 32.667
+  fuel_capacity_kl: 9047.0
+  speed_limit: 33.0
+DD-963/DDG-993:
+  a: -4.2882
+  b: 7.3285
+  c: 27.069
+  fuel_capacity_kl: 3248.0
+  speed_limit: 30.0
+DDG-51:
+  a: -1.8086
+  b: 3.264
+  c: 51.592
+  fuel_capacity_kl: 1508.0
+  speed_limit: 31.0
+FFG-7:
+  a: -1.2916
+  b: 2.2507
+  c: 51.878
+  fuel_capacity_kl: 1392.0
+  speed_limit: 29.0
+LCC-19:
+  a: -356.37
+  b: 358.03
+  c: 0.8807
+  fuel_capacity_kl: 1740.0
+  speed_limit: 23.0
+LHA-1:
+  a: -13.196
+  b: 15.45
+  c: 39.326
+  fuel_capacity_kl: 2900.0
+  speed_limit: 24.0
+LHD-1:
+  a: -1.6549
+  b: 4.8222
+  c: 78.234
+  fuel_capacity_kl: 3480.0
+  speed_limit: 22.0
+LPD-4/AGF-11:
+  a: -2.6601
+  b: 3.7067
+  c: 95.467
+  fuel_capacity_kl: 1740.0
+  speed_limit: 20.0
+LPH-2:
+  a: -601.56
+  b: 602.78
+  c: 0.33976
+  fuel_capacity_kl: 2088.0
+  speed_limit: 23.0
+LSD-36:
+  a: -1.5565
+  b: 2.5243
+  c: 98.677
+  fuel_capacity_kl: 1160.0
+  speed_limit: 20.0
+LSD-41:
+  a: -76.835
+  b: 77.4
+  c: 2.86
+  fuel_capacity_kl: 1392.0
+  speed_limit: 20.0
+PC-1:
+  a: -3316.0
+  b: 3316.1
+  c: 0.013275
+  fuel_capacity_kl: 100.0
+  speed_limit: 35.0
+TAO-187:
+  a: -649.41
+  b: 650.0
+  c: 0.63831
+  fuel_capacity_kl: 160.0
+  speed_limit: 20.0

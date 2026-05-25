@@ -1,0 +1,1161 @@
+# =============================================================================
+#  N-OILS  -  Naval Operations and Integrated Logistics Simulator
+#  Main Application Code  -  Version 3.16
+#
+#  A discrete-time simulation of naval surface-action-group (SAG) fuel logistics:
+#  ships surge from home ports to patrol boxes, patrol, signal for relief at 70%
+#  fuel, are tagged out by arriving replacements (or self-return at 50%), and
+#  transit to a DFSP to refuel before re-entering the ready rotation.
+#  Runs in Google Colab with an ipywidgets control panel.
+# =============================================================================
+import yaml
+import math
+import random
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML
+from tqdm.notebook import tqdm
+import gc
+import os
+from datetime import datetime
+from matplotlib.animation import FuncAnimation, PillowWriter
+from google.colab import drive
+from collections import deque
+import matplotlib.patches as mpatches
+
+# ====================== WIDGETS ======================
+DARK_BLUE = '#1F4E79'   # darker blue for buttons (v3.16)
+
+yaml_dir_input = widgets.Text(value='/content/drive/MyDrive/Colab Notebooks/N-OILS_Model_Library', description='File Directory:', style={'description_width': '150px'}, layout=widgets.Layout(width='800px'))
+
+init_dir_button = widgets.Button(description="Set Directory & Load Model Files", layout=widgets.Layout(width='800px', height='40px', display='flex', align_items='center', justify_content='center'))
+init_dir_button.style.button_color = DARK_BLUE
+init_dir_button.style.font_weight = 'bold'
+init_dir_button.style.text_color = 'white'
+
+run_type_dropdown = widgets.Dropdown(options=['Single Run (with Animation)', 'Single Run (without Animation)', 'Monte Carlo'], value='Single Run (with Animation)', description='Run Type:', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+mc_trials_input = widgets.IntText(value=100, description='Monte Carlo Trials (10-1000):', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+mc_trials_input.layout.display = 'none'
+
+ne_checkbox = widgets.Checkbox(value=True, description='SAG-NE')
+sw_checkbox = widgets.Checkbox(value=True, description='SAG-SW')
+ships_per_group_slider = widgets.IntSlider(value=5, min=1, max=7, description='Ships per Group:', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+initial_released_slider = widgets.IntSlider(value=3, min=1, max=7, description='Initial Released per Group:', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+
+# v3.15: duration is now user-selectable. Dragon-Taming #1 is 60 days; 10 is a faster debug placeholder.
+duration_input = widgets.IntText(value=10, description='Total Duration (days):', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+timestep_input = widgets.FloatText(value=15.0, description='Timestep (min):', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+
+ship_dropdown = widgets.Dropdown(description='Ship Type:', options=[], style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+velocity_mode_dropdown = widgets.Dropdown(options=['Constant (first roll only)', 'Resample every timestep', 'Probability-Based'], value='Constant (first roll only)', description='Velocity Mode:', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+fuel_dropdown = widgets.Dropdown(description='Fuel Type:', options=[], style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+refuel_option_dropdown = widgets.Dropdown(options=['Point of Origin', 'Custom (refueling.yaml)'], value='Point of Origin', description='Refueling Option:', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+
+sea_state_dropdown = widgets.Dropdown(options=['Off', 'Set Value', 'Dynamic (resampled every timestep)', 'Dynamic (delayed resampling)'], value='Off', description='Sea State:', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+sea_value_slider = widgets.IntSlider(value=4, min=0, max=9, description='Sea State Value:', style={'description_width': '200px'}, layout=widgets.Layout(width='800px'))
+sea_value_slider.layout.display = 'none'
+aux_toggle = widgets.Checkbox(value=False, description='Auxiliary Power Load On')
+
+def update_ui_visibility(change):
+    mc_trials_input.layout.display = 'flex' if run_type_dropdown.value == 'Monte Carlo' else 'none'
+run_type_dropdown.observe(update_ui_visibility, names='value')
+
+def update_sea_slider(change):
+    sea_value_slider.layout.display = 'flex' if change['new'] == 'Set Value' else 'none'
+sea_state_dropdown.observe(update_sea_slider, names='value')
+
+run_button = widgets.Button(description="Run Simulation", layout=widgets.Layout(width='800px', height='40px', display='flex', align_items='center', justify_content='center'))
+run_button.style.button_color = DARK_BLUE
+run_button.style.font_weight = 'bold'
+run_button.style.text_color = 'white'
+output_area = widgets.Output()
+
+control_group = widgets.VBox([
+    run_type_dropdown, mc_trials_input, ne_checkbox, sw_checkbox, ships_per_group_slider, initial_released_slider,
+    duration_input, timestep_input, ship_dropdown, velocity_mode_dropdown, fuel_dropdown, refuel_option_dropdown,
+    sea_state_dropdown, sea_value_slider, aux_toggle
+])
+control_group.layout.display = 'none'
+run_button.layout.display = 'none'
+
+def initialize_directory(b):
+    with output_area:
+        clear_output()
+        dir_path = yaml_dir_input.value.strip()
+        if dir_path.startswith('/content/drive') and not os.path.exists('/content/drive/MyDrive'):
+            drive.mount('/content/drive')
+
+        try:
+            with open(os.path.join(dir_path, 'baseline_ships.yaml'), 'r') as f: ships = yaml.safe_load(f)
+            with open(os.path.join(dir_path, 'movement_profiles.yaml'), 'r') as f: global movement_profiles; movement_profiles = yaml.safe_load(f)
+            with open(os.path.join(dir_path, 'alternative_fuel.yaml'), 'r') as f: global alt_fuels; alt_fuels = yaml.safe_load(f)
+            with open(os.path.join(dir_path, 'sea_state.yaml'), 'r') as f: global sea_states; sea_states = yaml.safe_load(f)
+            _refuel_path = os.path.join(dir_path, 'refueling.yaml')
+            if not os.path.exists(_refuel_path):
+                _refuel_path = os.path.join(dir_path, 'refueling.yaml.txt')  # legacy fallback
+            with open(_refuel_path, 'r') as f: global refuel_yaml; refuel_yaml = yaml.safe_load(f)
+
+            ship_dropdown.options = sorted(ships.keys())
+            ship_dropdown.value = 'CV-63/67'
+            fuel_dropdown.options = sorted(alt_fuels.keys())
+            fuel_dropdown.value = 'F-76'
+
+            print(f"\u2705 Model files successfully loaded.")
+            control_group.layout.display = 'flex'
+            run_button.layout.display = 'flex'
+        except Exception as e:
+            print(f"\u274c Error loading files: {e}")
+
+init_dir_button.on_click(initialize_directory)
+
+# ====================== GEOMETRY (pure-python, buffer-free) ======================
+land_coords = {
+    'Japan': [(2000,1875),(2250,1975),(2400,2100),(2450,2125),(2525,2325),(2550,2400),(2500,2525),(2750,2675),(2600,2725),(2525,2825),(2525,2725),(2450,2625),(2450,2375),(2400,2275),(2200,2125),(2000,2050),(1850,1925),(1925,1800),(2000,1875)],
+    'Taiwan': [(1360,1225),(1425,1365),(1475,1375),(1475,1425),(1400,1425),(1325,1300),(1360,1225)],
+    'Philippines': [(1400,1025),(1440,1000),(1450,900),(1400,825),(1625,650),(1650,525),(1685,350),(1600,275),(1500,425),(1360,800),(1325,900),(1375,1010),(1400,1025)],
+    'Mainland': [(0,2820),(0,0),(300,0),(400,50),(450,75),(400,175),(400,260),(175,500),(250,750),(500,500),(725,700),(725,800),(550,1000),(550,1100),(700,1200),(750,1125),(685,1050),(750,1000),(825,1075),(775,1175),(1250,1400),(1425,1700),(1425,1850),(1275,2050),(1475,2225),(1175,2290),(1400,2500),(1450,2450),(1400,2375),(1450,2350),(1550,2400),(1625,2375),(1590,2250),(1700,2250),(1710,2125),(1675,2000),(1850,2100),(1750,2350),(1750,2400),(1850,2475),(1850,2560),(1975,2650),(2025,2625),(2100,2625),(2250,2820),(0,2820)],
+    'Indonesia': [(700,0),(750,75),(800,50),(1150,350),(1225,250),(1225,25),(1800,25),(1800,0),(700,0)]
+}
+
+ne_corners = [(2215.95, 2743.98), (2475.43, 2568.95), (1664.05, 1366.02), (1401.56, 1541.05)]
+sw_corners = [(1455.95, 1630.98), (1715.44, 1455.95), (904.05, 253.02), (644.56, 428.05)]
+
+MAP_W, MAP_H = 3060, 2820
+
+def point_in_polygon(x, y, poly):
+    n = len(poly)
+    inside = False
+    p1x, p1y = poly[0]
+    xinters = 0.0
+    for i in range(n + 1):
+        p2x, p2y = poly[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    return inside
+
+def on_land(x, y, polys):
+    return any(point_in_polygon(x, y, p) for p in polys)
+
+def _seg_intersect(a, b, c, d):
+    """True if segment ab crosses segment cd."""
+    def ccw(p, q, r):
+        return (r[1] - p[1]) * (q[0] - p[0]) - (q[1] - p[1]) * (r[0] - p[0])
+    d1 = ccw(c, d, a); d2 = ccw(c, d, b); d3 = ccw(a, b, c); d4 = ccw(a, b, d)
+    if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)):
+        return True
+    return False
+
+def _pt_seg_dist(p, a, b):
+    """Shortest distance from point p to segment ab."""
+    ax, ay = a; bx, by = b; px, py = p
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+# ---- Occupancy grid + A* + line-of-sight smoothing (replaces the shapely visibility graph) ----
+GRID = 20         # nautical miles per occupancy cell
+CLEARANCE = 2.0   # sub-pixel land standoff (nm); prevents a smoothed leg from grazing a coastline tip
+
+def near_land(x, y, polys, clr=CLEARANCE):
+    """On land, or within the sub-pixel clearance of any coastline (used for routing only)."""
+    if on_land(x, y, polys):
+        return True
+    for p in polys:
+        m = len(p)
+        for i in range(m):
+            if _pt_seg_dist((x, y), p[i], p[(i + 1) % m]) < clr:
+                return True
+    return False
+
+class Pathfinder:
+    """Deterministic land-avoidance routing on a coarse occupancy grid with exact LOS smoothing."""
+    def __init__(self, polys, grid=GRID):
+        self.polys = polys
+        self.g = grid
+        self.nx = MAP_W // grid + 1
+        self.ny = MAP_H // grid + 1
+        # A cell is blocked if its center is on land or within the sub-pixel clearance of a coast.
+        self.blocked = [[near_land(i * grid, j * grid, polys) for j in range(self.ny)]
+                        for i in range(self.nx)]
+        self._cache = {}
+        self._edge = {}
+
+    def _edge_ok(self, ci, cj, ni, nj):
+        """Memoized: is the segment between two cell centers free of land?"""
+        k = (ci, cj, ni, nj)
+        v = self._edge.get(k)
+        if v is None:
+            v = self.seg_clear((ci * self.g, cj * self.g), (ni * self.g, nj * self.g))
+            self._edge[k] = v
+        return v
+
+    def _cell(self, p):
+        i = min(max(int(round(p[0] / self.g)), 0), self.nx - 1)
+        j = min(max(int(round(p[1] / self.g)), 0), self.ny - 1)
+        return (i, j)
+
+    def _free_cell(self, p):
+        """Nearest free cell to point p (BFS outward); points are normally already at sea."""
+        si, sj = self._cell(p)
+        if not self.blocked[si][sj]:
+            return (si, sj)
+        seen = {(si, sj)}
+        q = deque([(si, sj)])
+        while q:
+            i, j = q.popleft()
+            for di, dj in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < self.nx and 0 <= nj < self.ny and (ni, nj) not in seen:
+                    if not self.blocked[ni][nj]:
+                        return (ni, nj)
+                    seen.add((ni, nj)); q.append((ni, nj))
+        return (si, sj)
+
+    def seg_clear(self, a, b):
+        """True iff the straight leg a->b stays off land (exact: no polygon-edge crossing,
+        no endpoint on land, and no coastline grazed within the sub-pixel clearance)."""
+        if on_land(a[0], a[1], self.polys) or on_land(b[0], b[1], self.polys):
+            return False
+        for poly in self.polys:
+            m = len(poly)
+            for i in range(m):
+                c = poly[i]; d = poly[(i + 1) % m]
+                if _seg_intersect(a, b, c, d):
+                    return False
+                # keep the leg from skimming a sharp coastline tip (and from rounding onto it)
+                if _pt_seg_dist(c, a, b) < CLEARANCE:
+                    return False
+        return True
+
+    def _astar_cells(self, start_c, goal_c):
+        import heapq
+        if start_c == goal_c:
+            return [start_c]
+        nx, ny, blocked, g = self.nx, self.ny, self.blocked, self.g
+        def h(c):
+            return math.hypot(c[0] - goal_c[0], c[1] - goal_c[1]) * g
+        openh = [(h(start_c), 0.0, start_c)]
+        gscore = {start_c: 0.0}
+        came = {}
+        nbrs = ((1,0,1.0),(-1,0,1.0),(0,1,1.0),(0,-1,1.0),
+                (1,1,1.41421356),(1,-1,1.41421356),(-1,1,1.41421356),(-1,-1,1.41421356))
+        closed = set()
+        while openh:
+            f, gc, cur = heapq.heappop(openh)
+            if cur == goal_c:
+                path = [cur]
+                while cur in came:
+                    cur = came[cur]; path.append(cur)
+                path.reverse(); return path
+            if cur in closed:
+                continue
+            closed.add(cur)
+            ci, cj = cur
+            for di, dj, cost in nbrs:
+                ni, nj = ci + di, cj + dj
+                if 0 <= ni < nx and 0 <= nj < ny and not blocked[ni][nj]:
+                    if di != 0 and dj != 0:
+                        # forbid cutting the corner of ANY blocked (land) cell on a diagonal step
+                        if blocked[ci + di][cj] or blocked[ci][cj + dj]:
+                            continue
+                    # only traverse an edge whose cell-center segment is exactly land-free
+                    if not self._edge_ok(ci, cj, ni, nj):
+                        continue
+                    ng = gc + cost * g
+                    nc = (ni, nj)
+                    if ng < gscore.get(nc, 1e18):
+                        gscore[nc] = ng; came[nc] = cur
+                        heapq.heappush(openh, (ng + h(nc), ng, nc))
+        return None
+
+    def route(self, start, goal):
+        """Return a smoothed list of waypoints (excluding start, ending exactly at goal)."""
+        start = (float(start[0]), float(start[1]))
+        goal = (float(goal[0]), float(goal[1]))
+        if self.seg_clear(start, goal):
+            return [goal]
+        key = (self._cell(start), self._cell(goal))
+        if key in self._cache:
+            return list(self._cache[key])
+        sc = self._free_cell(start)
+        gcell = self._free_cell(goal)
+        cells = self._astar_cells(sc, gcell)
+        if not cells:
+            self._cache[key] = [goal]
+            return [goal]
+        pts = [start] + [(c[0] * self.g, c[1] * self.g) for c in cells] + [goal]
+        # string-pull: keep only waypoints needed to preserve a land-free path
+        smoothed = [pts[0]]
+        i = 0
+        while i < len(pts) - 1:
+            j = len(pts) - 1
+            while j > i + 1 and not self.seg_clear(pts[i], pts[j]):
+                j -= 1
+            smoothed.append(pts[j]); i = j
+        wp = smoothed[1:]
+        if not wp or wp[-1] != goal:
+            wp.append(goal)
+        self._cache[key] = list(wp)
+        return wp
+
+def route_to_refuel(ship, refuel_yaml, pf, option):
+    ship['mode'] = 'refuel'
+    ship['path'] = []
+    if option == 'Custom (refueling.yaml)':
+        best_dfsp, shortest = None, float('inf')
+        for loc in refuel_yaml.values():
+            p_route = pf.route(ship['position'], (loc['x'], loc['y']))
+            pts = [tuple(ship['position'])] + p_route
+            plen = sum(math.hypot(pts[i][0]-pts[i-1][0], pts[i][1]-pts[i-1][1]) for i in range(1, len(pts)))
+            if plen < shortest:
+                shortest, best_dfsp = plen, (loc['x'], loc['y'])
+        if best_dfsp:
+            ship['spawn'] = best_dfsp
+            ship['path'] = pf.route(ship['position'], best_dfsp)
+    else:
+        ship['path'] = pf.route(ship['position'], ship['spawn'])
+
+def get_movement_letter(ship):
+    mode = ship.get('mode', 'ready')
+    refuel_status = ship.get('refuel_status', 'none')
+    if mode == 'out_of_fuel': return 'O'
+    elif mode == 'ready': return 'W'
+    elif mode == 'surge': return 'Z'
+    elif mode == 'patrol': return 'S' if refuel_status == 'signaled' else 'P'
+    elif mode == 'refuel': return 'R' if refuel_status == 'tagged' else 'X'
+    elif mode == 'refueling': return 'F'
+    return 'W'
+
+# ====================== VELOCITY (Eq. C-2 / Eq. 1) ======================
+def roll_profile_speed(profile, speed_limit, mp):
+    """Single random speed draw for the given movement profile."""
+    if profile == 'surge':
+        prof = mp['Surge to Theater']
+        s = random.uniform(speed_limit * prof['min_pct'], speed_limit * prof['max_pct'])
+    elif profile == 'refuel':
+        prof = mp['Refuel Speed Profile']
+        s = random.uniform(speed_limit * prof['min_pct'], speed_limit * prof['max_pct'])
+    else:  # patrol / operational speed profile (Weibull, Eq. C-2)
+        op = mp['Operational Speed Profile']
+        s = op['alpha'] * (-math.log(1.0 - random.random())) ** (1.0 / op['beta']) * (speed_limit / 32.5)
+        s = min(s, speed_limit)
+    return round(s, 2)
+
+def update_velocity(ship, profile, speed_limit, mp, vel_mode, dt_hr):
+    """Apply the selected Velocity Change Mode. Returns the speed to use this timestep.
+
+    A change of movement profile (mandated change) always forces a fresh roll.
+    Otherwise, within a profile:
+      - 'Resample every timestep'   -> new roll each step
+      - 'Constant (first roll only)'-> hold the first roll until a mandated change
+      - 'Probability-Based'         -> Eq. 1 gate (a=-3, b=3, t = hrs since last change)
+    """
+    mandated = (ship.get('speed_profile') != profile) or (ship.get('speed') is None)
+    if mandated:
+        ship['speed'] = roll_profile_speed(profile, speed_limit, mp)
+        ship['speed_profile'] = profile
+        ship['t_vchg'] = 0.0
+    elif vel_mode == 'Resample every timestep':
+        ship['speed'] = roll_profile_speed(profile, speed_limit, mp)
+        ship['t_vchg'] = 0.0
+    elif vel_mode == 'Probability-Based':
+        lin = -3.0 + ship['t_vchg'] * 3.0
+        p_change = math.exp(lin) / (1.0 + math.exp(lin))
+        if random.random() < p_change:
+            ship['speed'] = roll_profile_speed(profile, speed_limit, mp)
+            ship['t_vchg'] = 0.0
+        else:
+            ship['t_vchg'] += dt_hr
+    else:  # Constant (first roll only)
+        ship['t_vchg'] += dt_hr
+    return ship['speed']
+
+# ====================== OUTPUT GRAPHS ======================
+def draw_static_map_layout(ax_anim, land_coords, refuel_option, refuel_yaml, P):
+    """Draw the legend, origins, patrol-box centers, and a RUN PARAMETERS box.
+
+    P is a dict of display values: ne, sw, aux, ships_per_group, initial_released, ship_type,
+    refuel_option, vel_mode, fuel_type, sea_header, timestep_min, duration_days.
+    Factored out of the animation so the layout can be unit-rendered and tuned independently.
+    The basemap image already shows coastlines, so no land/keep-out polygons are overlaid.
+    """
+    # ----- LEGEND -----
+    leg_x = 80
+    leg_y = 2690
+    line_sp = 78
+    n_entries = 7          # marker rows (NE ctr, SW ctr, DFSP, Origin, NE ship, SW ship, ID)
+    box_x = leg_x - 35
+    box_width = 980
+    title_y = leg_y + 0.35 * line_sp
+    text_y = leg_y - 0.55 * line_sp                       # first entry baseline, below the title
+    codes_y = text_y - n_entries * line_sp                # "Movement Codes:" heading
+    # Movement-code lines are drawn individually (not as one multiline string) so the box
+    # bottom can be computed deterministically in data units and always encloses them.
+    code_lines = [
+        "P = Patrolling,  S = Signaling + Patrolling",
+        "R = Returning w/ Tag,  X = Returning w/o Tag",
+        "Z = Surging to Theater,  W = Waiting",
+        "O = Out of Fuel,  F = Fueling",
+    ]
+    code_line_sp = 0.52 * line_sp
+    code_first_y = codes_y - 0.62 * line_sp
+    last_code_y = code_first_y - (len(code_lines) - 1) * code_line_sp
+    # Box spans from just above the title to just below the final movement-code line.
+    top = title_y + 0.5 * line_sp
+    bottom = last_code_y - 0.55 * line_sp
+    rect = mpatches.FancyBboxPatch((box_x, bottom), box_width, top - bottom, boxstyle="round,pad=14",
+                                   facecolor="lightyellow", edgecolor="gray", linewidth=1.5, alpha=0.92)
+    ax_anim.add_patch(rect)
+
+    # LEGEND title: centered horizontally over the box, sitting just inside the top edge.
+    ax_anim.text(box_x + box_width / 2, title_y, "LEGEND",
+                 fontweight='bold', ha='center', va='center', fontsize=11)
+
+    rows = [
+        ('+',  'blue', "SAG-NE Patrol Box Center"),
+        ('x',  'blue', "SAG-SW Patrol Box Center"),
+        ('s_open', 'darkblue', "DFSP Locations"),
+        ('s',  'darkblue', "Origin (Home Port)"),
+        ('o_ne', 'darkred', "SAG-NE Ship"),
+        ('o_sw', 'royalblue', "SAG-SW Ship"),
+        ('id', None, "Ship ID (#) and Movement Code"),
+    ]
+    for k, (kind, color, label) in enumerate(rows):
+        yy = text_y - k * line_sp
+        if kind == 's_open':
+            ax_anim.plot(leg_x, yy, 's', markerfacecolor='none', markeredgecolor=color, markersize=10, markeredgewidth=2)
+        elif kind == 's':
+            ax_anim.plot(leg_x, yy, 's', color=color, markersize=10)
+        elif kind in ('o_ne', 'o_sw'):
+            ax_anim.plot(leg_x, yy, 'o', color=color, markersize=12)
+            ax_anim.text(leg_x, yy, 'NE' if kind == 'o_ne' else 'SW', color='white', fontweight='bold', fontsize=6, ha='center', va='center')
+        elif kind == 'id':
+            ax_anim.text(leg_x, yy, "#-", fontweight='bold', fontsize=9, ha='center', va='center')
+        else:
+            ax_anim.plot(leg_x, yy, kind, color=color, markersize=11)
+        ax_anim.text(leg_x + 75, yy, label, va='center', fontsize=9)
+
+    ax_anim.text(leg_x - 15, codes_y, "Movement Codes:", fontsize=9, fontweight='bold', va='center', ha='left')
+    for j, cl in enumerate(code_lines):
+        ax_anim.text(leg_x - 15, code_first_y - j * code_line_sp, cl, fontsize=8, va='center', ha='left')
+
+    # DFSP markers (open squares) for any custom refueling locations; labels jogged right of the symbol.
+    if refuel_option == 'Custom (refueling.yaml)':
+        for loc in refuel_yaml.values():
+            ax_anim.plot(loc['x'], loc['y'], marker='s', markerfacecolor='none', markeredgecolor='darkblue', markersize=10, markeredgewidth=2)
+            ax_anim.text(loc['x'] + 55, loc['y'], loc['Label'], fontsize=9, color='darkblue', va='center', ha='left')
+
+    # Origins: filled squares; labels jogged right so the first letter clears the marker.
+    ax_anim.plot(2390, 2040, marker='s', color='darkblue', markersize=10)
+    ax_anim.text(2445, 2040, 'Yokosuka', fontsize=9, color='darkblue', va='center', ha='left')
+    ax_anim.plot(1330, 800, marker='s', color='darkblue', markersize=10)
+    ax_anim.text(1385, 800, 'Subic Bay', fontsize=9, color='darkblue', va='center', ha='left')
+
+    # Patrol-box centers
+    ax_anim.plot(1940, 2055, '+', color='blue', markersize=14)
+    ax_anim.plot(1180, 942, 'x', color='blue', markersize=14)
+
+    # ----- RUN PARAMETERS box (styled to match LEGEND: heading centered just inside the top) -----
+    rp_lines = [
+        f"SAG-NE: {P['ne']} | SAG-SW: {P['sw']} | APL: {'On' if P['aux'] else 'Off'}",
+        f"Ships per Group: {P['ships_per_group']} | Initial Release: {P['initial_released']}",
+        f"Ship Type: {P['ship_type']} | Refuel: {P['refuel_option']}",
+        f"Velocity Change Mode: {P['vel_mode']}",
+        f"Fuel Type: {P['fuel_type']} | Sea State: {P['sea_header']}",
+        f"Timestep (min): {P['timestep_min']} | Total Duration (days): {P['duration_days']}",
+    ]
+    rp_w = 1180
+    rp_x = 3030 - rp_w                 # right-aligned near the map's right edge
+    rp_line_sp = 70
+    n_rp = len(rp_lines)
+    rp_last_y = 80                                       # bottom line baseline
+    rp_first_y = rp_last_y + (n_rp - 1) * rp_line_sp     # top line baseline
+    rp_title_y = rp_first_y + 0.9 * rp_line_sp           # same heading gap as the LEGEND (0.9 line)
+    rp_top = rp_title_y + 0.5 * rp_line_sp
+    rp_bottom = rp_last_y - 0.5 * rp_line_sp
+    rp_rect = mpatches.FancyBboxPatch((rp_x, rp_bottom), rp_w, rp_top - rp_bottom, boxstyle="round,pad=14",
+                                      facecolor="lightyellow", edgecolor="gray", linewidth=1.5, alpha=0.92)
+    ax_anim.add_patch(rp_rect)
+    ax_anim.text(rp_x + rp_w / 2, rp_title_y, "RUN PARAMETERS", fontsize=11, fontweight='bold', ha='center', va='center')
+    for i, line in enumerate(rp_lines):
+        ax_anim.text(rp_x + rp_w / 2, rp_first_y - i * rp_line_sp, line,
+                     fontsize=9, ha='center', va='center')
+
+
+def _scale_money(values):
+    """Pick a $ scale (raw/K/M/B) from the max magnitude; return (scaled_array, unit_label, divisor)."""
+    import numpy as _np
+    arr = _np.asarray(list(values), dtype=float)
+    m = _np.nanmax(_np.abs(arr)) if arr.size else 0.0
+    if m >= 1e9:   div, unit = 1e9, "$ Billions"
+    elif m >= 1e6: div, unit = 1e6, "$ Millions"
+    elif m >= 1e3: div, unit = 1e3, "$ Thousands"
+    else:          div, unit = 1.0, "$"
+    return arr / div, unit, div
+
+
+def generate_graphs(results, out_dir):
+    print("\U0001F4CA Generating output graphs...")
+    def save_and_show(fig, filename):
+        fig.tight_layout()
+        # sanitize filename: strip characters that are illegal or path-breaking ($, /, (), spaces)
+        safe = filename
+        for ch, repl in [('/', '_per_'), ('$', ''), ('(', ''), (')', ''), (' ', '_'), ('%', 'pct')]:
+            safe = safe.replace(ch, repl)
+        fig.savefig(os.path.join(out_dir, safe), dpi=150)
+        display(fig)
+        plt.close(fig)
+
+    if 'Single' in run_type_dropdown.value:
+        # v3.15: plot ONLY individual ships (exclude the *Combined rows).
+        df_all = results['Summary_Ship']
+        df_ships = df_all[~df_all['Ship ID'].astype(str).str.contains('Combined', na=False)].copy()
+
+        labels = df_ships['Ship ID']
+
+        # 1) Time on Station (hours)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        v = df_ships['Time on Station (hrs)']
+        ax.bar(labels, v, color='steelblue')
+        ax.axhline(v.mean(), color='red', linestyle='--', label=f"Mean: {v.mean():.1f} hrs")
+        ax.set_title('Time on Station'); ax.set_ylabel('Time on Station (hours)'); ax.set_xlabel('Ship Identification'); ax.legend()
+        save_and_show(fig, 'Time_on_Station_Raw.png')
+
+        # 2) Time on Station (%)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        v = df_ships['Time on Station (%)']
+        ax.bar(labels, v, color='steelblue')
+        ax.axhline(v.mean(), color='red', linestyle='--', label=f"Mean: {v.mean():.1f}%")
+        ax.set_title('Time on Station (% of Simulation)'); ax.set_ylabel('Time on Station (% of total run time)'); ax.set_xlabel('Ship Identification'); ax.legend()
+        save_and_show(fig, 'Time_on_Station_Pct.png')
+
+        # 3) Patrol Distance Traveled (thousands of Nm)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        v = df_ships['Patrol distance (Nm)'] / 1000.0
+        ax.bar(labels, v, color='steelblue')
+        ax.axhline(v.mean(), color='red', linestyle='--', label=f"Mean: {v.mean():.2f}k Nm")
+        ax.set_title('Patrol Distance Traveled'); ax.set_ylabel('Patrol Distance (thousands of nautical miles)'); ax.set_xlabel('Ship Identification'); ax.legend()
+        save_and_show(fig, 'Patrol_Distance_Traveled.png')
+
+        # 4) Patrol Distance (% of total distance)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        v = df_ships['Patrol Distance (%)']
+        ax.bar(labels, v, color='steelblue')
+        ax.axhline(v.mean(), color='red', linestyle='--', label=f"Mean: {v.mean():.1f}%")
+        ax.set_title('Patrol Distance (% of Total Distance)'); ax.set_ylabel('Patrol Distance (% of total distance traveled)'); ax.set_xlabel('Ship Identification'); ax.legend()
+        save_and_show(fig, 'Patrol_Distance_Pct.png')
+
+        # 5) Cumulative Mission Cost (auto-scaled $)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        scaled, unit, _ = _scale_money(df_ships['Fuel Cost ($)'])
+        ax.bar(labels, scaled, color='steelblue')
+        ax.axhline(scaled.mean(), color='red', linestyle='--', label=f"Mean: {scaled.mean():,.2f} ({unit})")
+        ax.set_title('Cumulative Mission Cost (Fuel)'); ax.set_ylabel(f'Fuel Cost ({unit})'); ax.set_xlabel('Ship Identification'); ax.legend()
+        save_and_show(fig, 'Cumulative_Mission_Cost.png')
+
+        # 6) Cost Efficiency ($ per patrol-Nm) -- total fuel cost / patrol distance
+        fig, ax = plt.subplots(figsize=(10, 5))
+        v = df_ships['Cost Efficiency ($/Nm)']
+        ax.bar(labels, v, color='steelblue')
+        ax.axhline(v.mean(), color='red', linestyle='--', label=f"Mean: ${v.mean():,.2f}/patrol-Nm")
+        ax.set_title('Cost Efficiency (Total Fuel Cost per Patrol Distance)'); ax.set_ylabel('Cost Efficiency ($ per patrol nautical mile)'); ax.set_xlabel('Ship Identification'); ax.legend()
+        save_and_show(fig, 'Cost_Efficiency.png')
+
+        # Effective TOS: always show BOTH SAGs (blue), even if a zone never patrolled.
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sags = ['NE', 'SW']
+        vals = [results['Eff_TOS'].get(k, 0.0) for k in sags]
+        bars = ax.bar([f'SAG-{k}' for k in sags], vals, color='steelblue')
+        ax.set_title('Effective Time on Station')
+        ax.set_ylabel('Effective Coverage (% of required station-time)'); ax.set_xlabel('Surface Action Group')
+        ax.set_ylim(0, 100)
+        for bar in bars:
+            yval = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2, yval + 1, f'{yval:.1f}%', ha='center', va='bottom')
+        save_and_show(fig, "Effective_TOS.png")
+    else:
+        # Monte Carlo histograms. Each metric carries an axis unit; $ metrics are auto-scaled.
+        mc_specs = [
+            ('Cost', 'Cumulative Mission Cost', 'money'),
+            ('TOS', 'Time on Station', 'Time on Station (hours)'),
+            ('TOS_Pct', 'Time on Station (%)', 'Time on Station (% of total run time)'),
+            ('Dist', 'Patrol Distance Traveled', 'Patrol Distance (nautical miles)'),
+            ('Dist_Pct', 'Patrol Distance (%)', 'Patrol Distance (% of total distance)'),
+            ('Eff', 'Cost Efficiency', 'Cost Efficiency ($ per patrol nautical mile)'),
+        ]
+        import scipy.stats as st
+        for metric, title, unit in mc_specs:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+            fig.suptitle(f'Monte Carlo: {title}', fontsize=14, fontweight='bold')
+            # choose a common money scale across the three panels
+            money_div, money_unit = 1.0, '$'
+            if unit == 'money':
+                allv = []
+                for zone in ['NE', 'SW', 'Overall']:
+                    allv += list(results['MC_Data'][zone][metric])
+                _, money_unit, money_div = _scale_money(allv if allv else [0.0])
+            for i, zone in enumerate(['NE', 'SW', 'Overall']):
+                data = results['MC_Data'][zone][metric]
+                if not data: continue
+                ax = axes[i]
+                plot_data = [d / money_div for d in data] if unit == 'money' else data
+                ax.hist(plot_data, bins=20, color='seagreen', alpha=0.7, edgecolor='black')
+                mean_val = np.mean(plot_data)
+                ci = st.t.interval(0.95, len(plot_data)-1, loc=mean_val, scale=st.sem(plot_data)) if len(plot_data) > 1 else (mean_val, mean_val)
+                ax.axvline(mean_val, color='red', linestyle='dashed', linewidth=2)
+                ax.set_title(f"{zone} (n={len(data)})\nMean: {mean_val:,.2f} | 95% CI: [{ci[0]:,.2f}, {ci[1]:,.2f}]", fontsize=10)
+                ax.set_xlabel(money_unit if unit == 'money' else unit)
+                ax.set_ylabel('Number of trials')
+            save_and_show(fig, f"MC_{title}.png")
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig.suptitle('Monte Carlo: Effective Time on Station', fontsize=14, fontweight='bold')
+        for i, zone in enumerate(['NE', 'SW']):
+            data = results['MC_Data'][zone]['Eff_TOS']
+            if not data: continue
+            ax = axes[i]
+            ax.hist(data, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
+            mean_val = np.mean(data)
+            ax.axvline(mean_val, color='red', linestyle='dashed', linewidth=2)
+            ax.set_title(f"SAG-{zone} Mean: {mean_val:.2f}%")
+            ax.set_xlabel('Effective Coverage (% of required station-time)')
+            ax.set_ylabel('Number of trials')
+        save_and_show(fig, "MC_Effective_TOS.png")
+
+# ====================== MAIN RUN ======================
+def on_run_clicked(b):
+    import scipy.stats as st
+    with output_area:
+        clear_output()
+        dir_path = yaml_dir_input.value.strip()
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        out_dir = os.path.join(dir_path, f'NOILS_Run_{timestamp_str}')
+
+        run_type = run_type_dropdown.value
+        enable_anim = ('without' not in run_type) and (run_type != 'Monte Carlo')
+        n_trials = mc_trials_input.value if run_type == 'Monte Carlo' else 1
+
+        with open(os.path.join(dir_path, 'baseline_ships.yaml'), 'r') as f: ships = yaml.safe_load(f)
+
+        ship_params_raw = ships[ship_dropdown.value]
+        fuel_stock_kl = ship_params_raw.get('capacity_kl', ship_params_raw.get('fuel_capacity_kl', 1508.0))
+        # v3.15: read 'speed_limit' (the key actually used in baseline_ships.yaml) with sensible fallbacks.
+        speed_limit = ship_params_raw.get('speed_limit_kts', ship_params_raw.get('speed_limit', 31.0))
+        a_param = ship_params_raw.get('a', 0.0)
+        b_param = ship_params_raw.get('b', 0.0)
+        c_param = ship_params_raw.get('c', 0.0)
+
+        VED_GJ_L = alt_fuels[fuel_dropdown.value]['VED_GJ_L']
+        cost_per_kL = alt_fuels[fuel_dropdown.value].get('Cost_$_L', 5.0) * 1000.0
+
+        vel_mode = velocity_mode_dropdown.value
+
+        sea_mode = sea_state_dropdown.value
+        sea_on = sea_mode != 'Off'
+        sea_state_probs = {str(k): v['probability'] for k, v in sea_states.items() if isinstance(v, dict)}
+        sea_state_penalties = {str(k): v['energy_penalty'] for k, v in sea_states.items() if isinstance(v, dict)}
+
+        timestep_min = float(timestep_input.value)
+        dt_hr = timestep_min / 60.0
+        duration_days = int(duration_input.value)
+        max_steps = int(duration_days * 24 * 60 / timestep_min)
+        total_sim_hrs = duration_days * 24.0
+        # Eq. 1 constants for the sea-state "delayed resampling" mode
+        sea_chg_a, sea_chg_b = -3.0, 3.0
+
+        dfsp_ne = (2390.0, 2040.0)
+        dfsp_sw = (1330.0, 800.0)
+        patrol_centers = [(1940.0, 2055.0), (1180.0, 942.0)]
+        land_polygons = [coords for coords in land_coords.values()]
+
+        print("\U0001F5FA\uFE0F Building land-avoidance grid (one-time)...")
+        refuel_dict = refuel_yaml if refuel_option_dropdown.value == 'Custom (refueling.yaml)' else {}
+        nodes_to_check = [dfsp_ne, dfsp_sw]
+        for v in refuel_dict.values(): nodes_to_check.append((v['x'], v['y']))
+        for rn in nodes_to_check:
+            if on_land(rn[0], rn[1], land_polygons):
+                print(f"\u274c ERROR: Refueling node at {rn} is inside a keep-out polygon. Fix origin points or refueling.yaml.")
+                return
+
+        pf = Pathfinder(land_polygons, GRID)
+        os.makedirs(out_dir, exist_ok=True)
+
+        sea_header = f"{sea_mode} ({sea_value_slider.value})" if sea_mode == 'Set Value' else sea_mode
+        if sea_mode == 'Dynamic (delayed resampling)': sea_header = 'Dynamic-D'
+        elif sea_mode == 'Dynamic (resampled every timestep)': sea_header = 'Dynamic-T'
+
+        param_text = (f"N-OILS - Naval Operations and Integrated Logistics Simulator (v3.16)\n"
+                      f"Run Parameters\nRun Type: {run_type}\nTrials: {n_trials}\n"
+                      f"Ship: {ship_dropdown.value}\nFuel: {fuel_dropdown.value} (${cost_per_kL}/kL)\n"
+                      f"Refuel Logic: {refuel_option_dropdown.value}\nVelocity Mode: {vel_mode}\n"
+                      f"Sea State: {sea_state_dropdown.value}\nSAG-NE: {ne_checkbox.value} | SAG-SW: {sw_checkbox.value}\n"
+                      f"Req Ships: {initial_released_slider.value} / Grp: {ships_per_group_slider.value}\n"
+                      f"Duration (days): {duration_days}\nTimestep (min): {timestep_min}\n")
+        with open(os.path.join(out_dir, 'Run_Parameters.txt'), 'w') as f: f.write(param_text)
+
+        mc_results = {'NE': {'Cost':[], 'TOS':[], 'TOS_Pct':[], 'Dist':[], 'Dist_Pct':[], 'Eff':[], 'Eff_TOS':[]},
+                      'SW': {'Cost':[], 'TOS':[], 'TOS_Pct':[], 'Dist':[], 'Dist_Pct':[], 'Eff':[], 'Eff_TOS':[]},
+                      'Overall': {'Cost':[], 'TOS':[], 'TOS_Pct':[], 'Dist':[], 'Dist_Pct':[], 'Eff':[]}}
+
+        pbar = tqdm(total=max_steps * n_trials, desc="Simulating", unit="step")
+
+        def new_ship(sid, sag, local_id, spawn, center, corners):
+            return {'id': sid, 'sag': sag, 'local_id': local_id, 'spawn': spawn,
+                    'patrol_center': center, 'patrol_corners': corners, 'position': list(spawn),
+                    'fuel': fuel_stock_kl*1000.0, 'mode': 'ready', 'refuel_status': 'ready',
+                    'azimuth': random.uniform(0, 360), 'path': [], 'cum_dist': 0.0, 'patrol_dist': 0.0,
+                    'cum_fuel': 0.0, 'tos': 0.0, 'c_pat': 0, 's_pat': 0, 'c_ref': 0, 's_ref': 0,
+                    'speed': None, 'speed_profile': None, 't_vchg': 0.0,
+                    'signal_step': None, 'is_replacement': False}
+
+        for trial in range(n_trials):
+            all_ships = []
+            ne_local, sw_local = 1, 1
+            if ne_checkbox.value:
+                for _ in range(ships_per_group_slider.value):
+                    all_ships.append(new_ship(f'NE-{ne_local}', 'NE', ne_local, dfsp_ne, patrol_centers[0], ne_corners)); ne_local += 1
+            if sw_checkbox.value:
+                for _ in range(ships_per_group_slider.value):
+                    all_ships.append(new_ship(f'SW-{sw_local}', 'SW', sw_local, dfsp_sw, patrol_centers[1], sw_corners)); sw_local += 1
+
+            ready_queue = {'NE': deque([s for s in all_ships if s['sag']=='NE']), 'SW': deque([s for s in all_ships if s['sag']=='SW'])}
+            data_dict = {ship['id']: [] for ship in all_ships}
+            ne_patrol_counts, sw_patrol_counts = [], []
+            eff_tos_accumulator = {'NE': 0.0, 'SW': 0.0}
+            time_since_sea_change = 0.0
+
+            # Initial release: three (initial_released) ships per SAG surge to theater.
+            for sag in ['NE', 'SW']:
+                for _ in range(min(initial_released_slider.value, len(ready_queue[sag]))):
+                    s = ready_queue[sag].popleft()
+                    s['mode'] = 'surge'
+                    s['path'] = pf.route(s['position'], s['patrol_center'])
+
+            for step in range(1, max_steps + 1):
+                # ----- Sea state roll (independent of velocity mode in this build) -----
+                sea_rolled_this_step = 'no'
+                if sea_on:
+                    if sea_mode == 'Set Value':
+                        current_sea = sea_value_slider.value
+                    elif sea_mode == 'Dynamic (resampled every timestep)':
+                        current_sea = random.choices(list(sea_state_probs.keys()), weights=list(sea_state_probs.values()))[0]
+                        sea_rolled_this_step = 'yes'
+                    elif sea_mode == 'Dynamic (delayed resampling)':
+                        linear_term = sea_chg_a + (time_since_sea_change * sea_chg_b)
+                        p_change = math.exp(linear_term) / (1 + math.exp(linear_term))
+                        if random.random() < p_change or time_since_sea_change == 0.0:
+                            current_sea = random.choices(list(sea_state_probs.keys()), weights=list(sea_state_probs.values()))[0]
+                            time_since_sea_change = 0.0
+                            sea_rolled_this_step = 'yes'
+                        else:
+                            time_since_sea_change += dt_hr
+                else:
+                    current_sea = 0
+                sea_pen = sea_state_penalties.get(str(current_sea), 0.0)
+
+                # ----- Demand / release check -----
+                # A SAG needs `initial_released` ships actively covering (surging or patrolling
+                # while NOT signaling). Every signaling ship needs exactly one replacement en
+                # route to relieve it. Release reserves to satisfy both, marking any reserve
+                # sent to relieve a signaling ship as a replacement (it will perform the tag-out
+                # on arrival). Reserves sent only to fill an empty slot are NOT replacements.
+                for sag in ['NE', 'SW']:
+                    covering = sum(1 for s in all_ships if s['sag'] == sag
+                                   and s['mode'] in ('surge', 'patrol') and s['refuel_status'] != 'signaled')
+                    # signaling ships not yet promised a replacement
+                    signaled = [s for s in all_ships if s['sag'] == sag and s['mode'] == 'patrol'
+                                and s['refuel_status'] == 'signaled']
+                    replacements_enroute = sum(1 for s in all_ships if s['sag'] == sag
+                                               and s['is_replacement'] and s['mode'] == 'surge')
+                    unmet_relief = max(0, len(signaled) - replacements_enroute)
+                    slot_gap = max(0, initial_released_slider.value - covering)
+                    needed = max(slot_gap, unmet_relief)
+                    while needed > 0 and ready_queue[sag]:
+                        s = ready_queue[sag].popleft()
+                        s['mode'] = 'surge'
+                        s['is_replacement'] = (unmet_relief > 0)
+                        if unmet_relief > 0:
+                            unmet_relief -= 1
+                        s['path'] = pf.route(s['position'], s['patrol_center'])
+                        needed -= 1
+
+                for ship in all_ships:
+                    move_profile_letter = get_movement_letter(ship)
+
+                    # ----- Speed (velocity change mode) -----
+                    if ship['mode'] in ('ready', 'refueling', 'out_of_fuel'):
+                        ship_speed = 0.0
+                        ship['speed_profile'] = None
+                        ship['speed'] = None
+                    else:
+                        prof = 'surge' if ship['mode'] == 'surge' else ('refuel' if ship['mode'] == 'refuel' else 'patrol')
+                        ship_speed = update_velocity(ship, prof, speed_limit, movement_profiles, vel_mode, dt_hr)
+
+                    # ----- MOVEMENT: surge / refuel follow a planned route -----
+                    if ship['mode'] in ('surge', 'refuel'):
+                        if not ship['path']:
+                            dest = ship['patrol_center'] if ship['mode'] == 'surge' else ship['spawn']
+                            ship['path'] = pf.route(ship['position'], dest)
+                        if ship['path']:
+                            target_node = ship['path'][0]
+                            dist = math.hypot(target_node[0] - ship['position'][0], target_node[1] - ship['position'][1])
+                            if dist <= ship_speed * dt_hr:
+                                ship['position'] = list(target_node)
+                                ship['cum_dist'] += dist
+                                ship['path'].pop(0)
+                                if not ship['path']:
+                                    t_arr = dist/ship_speed if ship_speed > 0 else 0
+                                    if t_arr < (dt_hr/2.0):
+                                        ship_speed = 0.0
+                                        if ship['mode'] == 'surge':
+                                            ship['mode'] = 'patrol'
+                                            ship['s_pat'] += 1
+                                            ship['azimuth'] = random.uniform(0, 360)
+                                            ship['speed_profile'] = None  # force patrol-speed roll next step
+                                            # Only a designated replacement performs a tag-out, and it
+                                            # relieves the ship that has been signaling the LONGEST.
+                                            if ship['is_replacement']:
+                                                ship['is_replacement'] = False
+                                                candidates = [t for t in all_ships
+                                                              if t['sag'] == ship['sag'] and t['mode'] == 'patrol'
+                                                              and t['refuel_status'] == 'signaled' and t['id'] != ship['id']]
+                                                if candidates:
+                                                    tag_target = min(candidates, key=lambda t: t['signal_step'] if t['signal_step'] is not None else 1e18)
+                                                    tag_target['refuel_status'] = 'tagged'
+                                                    tag_target['c_pat'] += 1   # completed a patrol
+                                                    tag_target['s_ref'] += 1   # started a refuel transit
+                                                    route_to_refuel(tag_target, refuel_yaml, pf, refuel_option_dropdown.value)
+                                        else:  # arrived at DFSP -> begin refueling
+                                            ship['mode'] = 'refueling'
+                                            ship['refuel_time_left'] = max(1, int(random.uniform(6, 18) / dt_hr))
+                            else:
+                                ship['position'][0] += (target_node[0]-ship['position'][0])/dist * ship_speed * dt_hr
+                                ship['position'][1] += (target_node[1]-ship['position'][1])/dist * ship_speed * dt_hr
+                                ship['cum_dist'] += ship_speed * dt_hr
+
+                    # ----- MOVEMENT: patrol random walk (Operational Speed Profile) -----
+                    elif ship['mode'] == 'patrol':
+                        moved = False
+                        az = ship['azimuth']
+                        # First try +/-7.5 deg about the previous azimuth (15 deg span).
+                        cand = (az + random.uniform(-7.5, 7.5)) % 360
+                        for attempt in range(40):
+                            dx = math.cos(math.radians(cand)) * ship_speed * dt_hr
+                            dy = math.sin(math.radians(cand)) * ship_speed * dt_hr
+                            px, py = ship['position'][0]+dx, ship['position'][1]+dy
+                            if point_in_polygon(px, py, ship['patrol_corners']) and not on_land(px, py, land_polygons):
+                                ship['azimuth'] = cand
+                                ship['position'] = [px, py]
+                                ship['cum_dist'] += ship_speed * dt_hr
+                                ship['patrol_dist'] += ship_speed * dt_hr
+                                moved = True
+                                break
+                            # Out of bounds: rotate +/-45 deg (random direction) and retry.
+                            cand = (cand + random.choice([-45, 45])) % 360
+                        if not moved:
+                            cx, cy = ship['patrol_center']
+                            ship['azimuth'] = math.degrees(math.atan2(cy - ship['position'][1], cx - ship['position'][0])) % 360
+
+                    # ----- Refueling countdown -----
+                    elif ship['mode'] == 'refueling':
+                        ship['refuel_time_left'] -= 1
+                        if ship['refuel_time_left'] <= 0:
+                            ship['fuel'] = fuel_stock_kl * 1000.0
+                            ship['mode'] = 'ready'
+                            ship['refuel_status'] = 'ready'
+                            ship['signal_step'] = None
+                            ship['is_replacement'] = False
+                            ship['c_ref'] += 1
+                            ready_queue[ship['sag']].append(ship)
+
+                    # ----- Fuel accounting + status transitions -----
+                    if move_profile_letter in ('O', 'W', 'F'):
+                        ship_speed = 0.0
+                        ecr_total_gj = 0.0
+                        fcr_lpm = 0.0
+                        apl = 0.0
+                    else:
+                        raw_ecr = a_param + b_param * math.exp(c_param * (ship_speed / 100.0)**3) if ship_speed > 0 else 0.0
+                        is_patrol = (move_profile_letter in ('P', 'S'))
+                        apl = random.uniform(0.066, 0.360) if (aux_toggle.value and is_patrol) else 0.0
+                        ecr_total_gj = raw_ecr * (1 + sea_pen) + apl
+                        fcr_lpm = ecr_total_gj / VED_GJ_L
+
+                        fuel_used_l = fcr_lpm * timestep_min
+                        prev_fuel = ship['fuel']
+                        ship['fuel'] = max(0.0, prev_fuel - fuel_used_l)
+                        # v3.15: cumulative consumption tracks the ACTUAL onboard drop (so it never
+                        # diverges from onboard fuel once a tank clamps at zero).
+                        ship['cum_fuel'] += (prev_fuel - ship['fuel']) / 1000.0
+
+                        # v3.15: real out-of-fuel state (ship can no longer move).
+                        if ship['fuel'] <= 0.0 and ship['mode'] in ('surge', 'refuel'):
+                            ship['mode'] = 'out_of_fuel'
+
+                        fuel_pct = ship['fuel'] / (fuel_stock_kl * 1000.0)
+                        if ship['mode'] == 'patrol':
+                            if fuel_pct <= 0.70 and ship['refuel_status'] == 'ready':
+                                ship['refuel_status'] = 'signaled'
+                                ship['signal_step'] = step   # timestamp for longest-waiting tag-out order
+                            if fuel_pct <= 0.50:
+                                ship['refuel_status'] = 'untagged'
+                                ship['c_pat'] += 1
+                                ship['s_ref'] += 1
+                                route_to_refuel(ship, refuel_yaml, pf, refuel_option_dropdown.value)
+                        elif ship['mode'] == 'surge' and fuel_pct <= 0.50:
+                            ship['refuel_status'] = 'untagged'
+                            ship['s_ref'] += 1
+                            route_to_refuel(ship, refuel_yaml, pf, refuel_option_dropdown.value)
+
+                    # v3.15: time-on-station accrues for every P/S timestep (decoupled from move success).
+                    if move_profile_letter in ('P', 'S'):
+                        ship['tos'] += dt_hr
+
+                    if run_type != 'Monte Carlo':
+                        data_dict[ship['id']].append({
+                            'Step': step, 'Ship ID': ship['id'], 'Movement Profile': move_profile_letter,
+                            'Speed (knots)': ship_speed, 'Distance Traveled (Nm)': ship['cum_dist'],
+                            'Cumulative Fuel Consumed (kL)': ship['cum_fuel'], 'Fuel Cost ($)': ship['cum_fuel'] * cost_per_kL,
+                            'Vessel Position (x,y)': f"({ship['position'][0]:.2f}, {ship['position'][1]:.2f})",
+                            'Sea State': current_sea, 'Sea State Rolled': sea_rolled_this_step,
+                            'FCR (L/min)': fcr_lpm, 'ECR (GJ/min)': ecr_total_gj, 'APL (GJ/min)': apl,
+                            'Onboard Fuel (kL)': round(ship['fuel']/1000.0, 6),
+                            'Patrol Distance (Nm)': ship['patrol_dist'], 'Time on Station (hrs)': ship['tos']
+                        })
+
+                # Effective TOS / coverage logging
+                n_ne = sum(1 for s in all_ships if s['sag']=='NE' and s['mode']=='patrol')
+                n_sw = sum(1 for s in all_ships if s['sag']=='SW' and s['mode']=='patrol')
+                req = initial_released_slider.value
+                eff_tos_accumulator['NE'] += min(n_ne, req) / req * dt_hr
+                eff_tos_accumulator['SW'] += min(n_sw, req) / req * dt_hr
+                ne_patrol_counts.append(n_ne)
+                sw_patrol_counts.append(n_sw)
+                pbar.update(1)
+
+            # --- Trial-end aggregation (Monte Carlo) ---
+            if run_type == 'Monte Carlo':
+                for sag in ['NE', 'SW']:
+                    s_ships = [s for s in all_ships if s['sag']==sag]
+                    if not s_ships: continue
+                    cst = sum(s['cum_fuel']*cost_per_kL for s in s_ships)
+                    tos = sum(s['tos'] for s in s_ships)
+                    dst = sum(s['patrol_dist'] for s in s_ships)
+                    tot_dst = sum(s['cum_dist'] for s in s_ships)
+                    mc_results[sag]['Cost'].append(cst)
+                    mc_results[sag]['TOS'].append(tos)
+                    mc_results[sag]['TOS_Pct'].append(tos / (total_sim_hrs * len(s_ships)) * 100 if s_ships else 0)
+                    mc_results[sag]['Dist'].append(dst)
+                    mc_results[sag]['Dist_Pct'].append(dst / tot_dst * 100 if tot_dst > 0 else 0)
+                    mc_results[sag]['Eff'].append(cst / dst if dst > 0 else 0)
+                    mc_results[sag]['Eff_TOS'].append(eff_tos_accumulator[sag] / total_sim_hrs * 100)
+                tot_cum = sum(s['cum_dist'] for s in all_ships)
+                mc_results['Overall']['Cost'].append(sum(s['cum_fuel']*cost_per_kL for s in all_ships))
+                mc_results['Overall']['TOS'].append(sum(s['tos'] for s in all_ships))
+                mc_results['Overall']['TOS_Pct'].append(sum(s['tos'] for s in all_ships) / (total_sim_hrs * len(all_ships)) * 100)
+                mc_results['Overall']['Dist'].append(sum(s['patrol_dist'] for s in all_ships))
+                mc_results['Overall']['Dist_Pct'].append(sum(s['patrol_dist'] for s in all_ships) / tot_cum * 100 if tot_cum > 0 else 0)
+                mc_results['Overall']['Eff'].append(mc_results['Overall']['Cost'][-1] / mc_results['Overall']['Dist'][-1] if mc_results['Overall']['Dist'][-1] > 0 else 0)
+
+        pbar.close()
+
+        # ====================== FILE OUTPUTS ======================
+        if run_type != 'Monte Carlo':
+            print("\U0001F4BE Writing Single Run Data to Excel...")
+            writer = pd.ExcelWriter(os.path.join(out_dir, 'NOILS_SingleRun_Output.xlsx'), engine='openpyxl')
+
+            summary_rows = []
+            for s in all_ships:
+                summary_rows.append({
+                    'Ship ID': s['id'], 'Total completed patrols': s['c_pat'], 'Total started patrols': s['s_pat'],
+                    'Total completed refuels': s['c_ref'], 'Total started refuels': s['s_ref'],
+                    'Cumulative fuel consumed (kL)': s['cum_fuel'], 'Fuel Cost ($)': s['cum_fuel']*cost_per_kL,
+                    'Distance traveled (Nm)': s['cum_dist'], 'Patrol distance (Nm)': s['patrol_dist'], 'Time on Station (hrs)': s['tos'],
+                    'Time on Station (%)': (s['tos']/total_sim_hrs)*100, 'Patrol Distance (%)': (s['patrol_dist']/s['cum_dist'])*100 if s['cum_dist'] > 0 else 0,
+                    'Cost Efficiency ($/Nm)': (s['cum_fuel']*cost_per_kL)/s['patrol_dist'] if s['patrol_dist'] > 0 else 0
+                })
+
+            base_ships = [s for s in summary_rows if 'Combined' not in s['Ship ID']]
+            for sag, prefix in [('NE-', 'NE SAG Combined'), ('SW-', 'SW SAG Combined'), ('ALL', 'Overall Combined')]:
+                grp = [s for s in base_ships if (sag == 'ALL' or s['Ship ID'].startswith(sag))]
+                if grp:
+                    summary_rows.append({
+                        'Ship ID': prefix, 'Total completed patrols': sum(x['Total completed patrols'] for x in grp),
+                        'Total started patrols': sum(x['Total started patrols'] for x in grp),
+                        'Total completed refuels': sum(x['Total completed refuels'] for x in grp),
+                        'Total started refuels': sum(x['Total started refuels'] for x in grp),
+                        'Cumulative fuel consumed (kL)': sum(x['Cumulative fuel consumed (kL)'] for x in grp),
+                        'Fuel Cost ($)': sum(x['Fuel Cost ($)'] for x in grp),
+                        'Distance traveled (Nm)': sum(x['Distance traveled (Nm)'] for x in grp),
+                        'Patrol distance (Nm)': sum(x['Patrol distance (Nm)'] for x in grp),
+                        'Time on Station (hrs)': sum(x['Time on Station (hrs)'] for x in grp),
+                        'Time on Station (%)': sum(x['Time on Station (%)'] for x in grp) / len(grp) if grp else 0,
+                        'Patrol Distance (%)': sum(x['Patrol Distance (%)'] for x in grp) / len(grp) if grp else 0,
+                        'Cost Efficiency ($/Nm)': sum(x['Fuel Cost ($)'] for x in grp)/sum(x['Patrol distance (Nm)'] for x in grp) if sum(x['Patrol distance (Nm)'] for x in grp) > 0 else 0
+                    })
+
+            df_sum = pd.DataFrame(summary_rows)
+            df_sum.to_excel(writer, sheet_name='Summary Ship Data', index=False)
+
+            for sid, rows in data_dict.items():
+                df = pd.DataFrame(rows)
+                metadata = pd.DataFrame([
+                    ['Simulation Parameters'] + ['']*(len(df.columns)-1),
+                    ['Ship Type', ship_dropdown.value] + ['']*(len(df.columns)-2),
+                    ['Fuel Type', fuel_dropdown.value] + ['']*(len(df.columns)-2),
+                    ['Sea State Mode', sea_header] + ['']*(len(df.columns)-2),
+                    ['Auxiliary Power Load', 'On' if aux_toggle.value else 'Off'] + ['']*(len(df.columns)-2),
+                    ['Velocity Change Mode', vel_mode] + ['']*(len(df.columns)-2),
+                    ['SAG-NE', str(ne_checkbox.value)] + ['']*(len(df.columns)-2),
+                    ['SAG-SW', str(sw_checkbox.value)] + ['']*(len(df.columns)-2),
+                    ['Ships per Group', ships_per_group_slider.value] + ['']*(len(df.columns)-2),
+                    ['Initial Released per Group', initial_released_slider.value] + ['']*(len(df.columns)-2),
+                    ['Timestep (min)', timestep_min] + ['']*(len(df.columns)-2),
+                    ['Total Duration (days)', duration_days] + ['']*(len(df.columns)-2),
+                ], columns=df.columns)
+                df = pd.concat([metadata, df], ignore_index=True)
+                df.to_excel(writer, sheet_name=sid, index=False)
+
+            detailed_df = pd.DataFrame([{'Step': t, 'NE ships patrolling': ne_patrol_counts[t], 'SW ships patrolling': sw_patrol_counts[t], 'Combined ships patrolling': ne_patrol_counts[t] + sw_patrol_counts[t]} for t in range(max_steps)])
+            detailed_df.to_excel(writer, sheet_name='Detailed Measures', index=False)
+
+            max_slots = 2 * ships_per_group_slider.value + 1
+            ne_h = [0.0]*max_slots; sw_h = [0.0]*max_slots; cb_h = [0.0]*max_slots
+            for t in range(max_steps):
+                ne_h[ne_patrol_counts[t]] += dt_hr
+                sw_h[sw_patrol_counts[t]] += dt_hr
+                cb_h[ne_patrol_counts[t] + sw_patrol_counts[t]] += dt_hr
+            sm_rows = []
+            for z, arr in [('SAG-NE', ne_h), ('SAG-SW', sw_h), ('Combined', cb_h)]:
+                r = {'Zone': z}
+                for n in range(max_slots): r[f'{n} ships'] = round(arr[n], 2)
+                sm_rows.append(r)
+            pd.DataFrame(sm_rows).to_excel(writer, sheet_name='Summary Measures', index=False)
+            writer.close()
+
+            graph_data = {'Summary_Ship': df_sum, 'Eff_TOS': {'NE': eff_tos_accumulator['NE']/total_sim_hrs*100, 'SW': eff_tos_accumulator['SW']/total_sim_hrs*100}}
+            generate_graphs(graph_data, out_dir)
+
+            # ====================== ANIMATION ======================
+            if enable_anim:
+                print("\U0001F3A5 Generating Animation...")
+                fig_anim, ax_anim = plt.subplots(figsize=(14, 10))
+                try:
+                    img = plt.imread(os.path.join(dir_path, 'dragon_taming_map.png'))
+                except Exception:
+                    from PIL import Image as _PILImage
+                    img = np.asarray(_PILImage.open(os.path.join(dir_path, 'dragon_taming_map.png')))
+                ax_anim.imshow(img, extent=[0, MAP_W, 0, MAP_H], alpha=0.85)
+                ax_anim.set_xlim(0, MAP_W); ax_anim.set_ylim(0, MAP_H)
+
+                layout_params = {
+                    'ne': ne_checkbox.value, 'sw': sw_checkbox.value, 'aux': aux_toggle.value,
+                    'ships_per_group': ships_per_group_slider.value, 'initial_released': initial_released_slider.value,
+                    'ship_type': ship_dropdown.value, 'refuel_option': refuel_option_dropdown.value,
+                    'vel_mode': vel_mode, 'fuel_type': fuel_dropdown.value, 'sea_header': sea_header,
+                    'timestep_min': timestep_min, 'duration_days': duration_days,
+                }
+                draw_static_map_layout(ax_anim, land_coords, refuel_option_dropdown.value, refuel_yaml, layout_params)
+
+                s_marks, s_grps, s_lbls = {}, {}, {}
+                for ship in all_ships:
+                    color = 'darkred' if ship['sag'] == 'NE' else 'royalblue'
+                    s_marks[ship['id']], = ax_anim.plot([], [], 'o', color=color, markersize=10, markeredgecolor='black')
+                    s_grps[ship['id']] = ax_anim.text(0, 0, ship['sag'], fontsize=6, ha='center', va='center', color='white', weight='bold')
+                    s_lbls[ship['id']] = ax_anim.text(0, 0, '', fontsize=9, ha='center', va='bottom', color='black', weight='bold')
+
+                skip_frames = max(1, int(60 / timestep_min))
+                n_frames = max(1, max_steps // skip_frames)
+                def init():
+                    return list(s_marks.values()) + list(s_grps.values()) + list(s_lbls.values())
+                def update(frame):
+                    idx = min(frame * skip_frames, max_steps-1)
+                    for ship in all_ships:
+                        row = data_dict[ship['id']][idx]
+                        pos_str = row['Vessel Position (x,y)'].strip('()')
+                        x, y = map(float, pos_str.split(','))
+                        s_marks[ship['id']].set_data([x], [y])
+                        s_grps[ship['id']].set_position((x, y))
+                        s_lbls[ship['id']].set_position((x, y + 40))
+                        s_lbls[ship['id']].set_text(f"{ship['local_id']}-{row['Movement Profile']}")
+                    return list(s_marks.values()) + list(s_grps.values()) + list(s_lbls.values())
+
+                print("\U0001F3AC Generating frames...")
+                ani = FuncAnimation(fig_anim, update, frames=n_frames, init_func=init, blit=True, interval=80)
+                gif_path = os.path.join(out_dir, 'NOILS_Animation.gif')
+                print("\u23F3 Encoding GIF (this can take a while)...")
+                with tqdm(total=n_frames, desc="Encoding GIF", unit="frame") as pbar_enc:
+                    def _enc_progress(current_frame, total_frames):
+                        pbar_enc.update(1)
+                    ani.save(gif_path, writer=PillowWriter(fps=10), progress_callback=_enc_progress)
+                print(f"\u2705 GIF saved to {gif_path}")
+
+                # Interactive, pause-able player (HTML5 controls: play/pause, step, scrub, loop).
+                # Rendered inline in Colab and saved as a standalone .html the user can reopen.
+                # The player embeds every frame as an image, so for long runs we cap the number
+                # of frames (the GIF above keeps the full cadence).
+                print("\U0001F39B\uFE0F Building interactive (pause-able) player...")
+                try:
+                    MAX_PLAYER_FRAMES = 100
+                    if n_frames > MAX_PLAYER_FRAMES:
+                        stride = math.ceil(n_frames / MAX_PLAYER_FRAMES)
+                        player_frames = list(range(0, n_frames, stride))
+                        print(f"   (downsampling {n_frames} frames to {len(player_frames)} for a loadable player)")
+                    else:
+                        player_frames = list(range(n_frames))
+                    plt.rcParams['animation.embed_limit'] = 200  # MB
+                    _saved_dpi = fig_anim.get_dpi()
+                    fig_anim.set_dpi(70)  # smaller embedded frames -> smaller HTML; GIF keeps full quality
+                    print(f"   Encoding {len(player_frames)} frames into the interactive player...")
+                    with tqdm(total=len(player_frames), desc="Building player", unit="frame") as pbar_play:
+                        ani_player = FuncAnimation(fig_anim, update, frames=player_frames, init_func=init, blit=True, interval=80)
+                        html_player = ani_player.to_jshtml(fps=10)
+                        pbar_play.update(len(player_frames))
+                    fig_anim.set_dpi(_saved_dpi)
+                    html_path = os.path.join(out_dir, 'NOILS_Animation_interactive.html')
+                    with open(html_path, 'w') as f:
+                        f.write(html_player)
+                    print("\U0001F4BE Saving + displaying interactive player...")
+                    display(HTML(html_player))
+                    print(f"\u2705 Interactive player saved to {html_path}")
+                except Exception as e:
+                    print(f"\u26A0\uFE0F Interactive player unavailable ({e}); GIF was still saved.")
+                plt.close(fig_anim)
+
+        else:
+            print("\U0001F4BE Writing Monte Carlo Data to Excel...")
+            writer = pd.ExcelWriter(os.path.join(out_dir, 'NOILS_MonteCarlo_Output.xlsx'), engine='openpyxl')
+            for zone in ['NE', 'SW', 'Overall']:
+                df = pd.DataFrame(mc_results[zone])
+                df.index.name = 'Trial'
+                df.to_excel(writer, sheet_name=f'MC_Raw_{zone}')
+                stats = []
+                for col in df.columns:
+                    data = df[col].dropna()
+                    if len(data) == 0: continue
+                    mean = data.mean()
+                    se = st.sem(data)
+                    ci = st.t.interval(0.95, len(data)-1, loc=mean, scale=se) if len(data) > 1 else (mean, mean)
+                    stats.append({'Metric': col, 'Mean': mean, 'StdDev': data.std(), '95% CI Lower': ci[0], '95% CI Upper': ci[1], 'Min': data.min(), 'Max': data.max(), 'n': len(data)})
+                pd.DataFrame(stats).to_excel(writer, sheet_name=f'MC_Stats_{zone}', index=False)
+            writer.close()
+            generate_graphs({'MC_Data': mc_results}, out_dir)
+            print("\u2705 Monte Carlo run complete.")
+
+        print(f"\U0001F389 Complete! All files saved in: {out_dir}")
+        plt.close('all')
+        gc.collect()
+
+run_button.on_click(on_run_clicked)
+display(yaml_dir_input, init_dir_button, control_group, run_button, output_area)

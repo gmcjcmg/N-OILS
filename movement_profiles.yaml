@@ -1,0 +1,15 @@
+# movement_profiles.yaml for N-OILS v3.16.
+# All values are real and matched to the model.
+
+Operational Speed Profile:
+  alpha: 15.052468
+  beta: 2.2222805
+  type: weibull
+Refuel Speed Profile:
+  max_pct: 0.55
+  min_pct: 0.35
+  type: uniform
+Surge to Theater:
+  max_pct: 0.85
+  min_pct: 0.75
+  type: uniform

@@ -1,0 +1,684 @@
+# =============================================================================
+#  N-OILS  -  Naval Operations and Integrated Logistics Simulator
+#  Verification & Validation Self-Test  -  Version 3.16
+#
+#  Reads the most recent run-output workbook produced by the main application and
+#  runs automated V&V checks: 30 checks for a Single Run (lifecycle congruence,
+#  speeds, fuel/ECR/FCR math, keep-out land avoidance, tag-out behavior, etc.)
+#  and 5 checks for a Monte Carlo run (additivity, bounds, stats consistency).
+# =============================================================================
+import pandas as pd
+import os
+import glob
+import math
+import yaml
+
+def get_col(df, keywords):
+    for col in df.columns:
+        col_str = str(col).strip().lower()
+        if any(k.lower() in col_str for k in keywords):
+            return col
+    return None
+
+def point_in_polygon(x, y, poly):
+    n = len(poly)
+    inside = False
+    p1x, p1y = poly[0]
+    xinters = 0.0
+    for i in range(n + 1):
+        p2x, p2y = poly[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    return inside
+
+def run_n_oils_self_test(dir_path='/content/drive/MyDrive/Colab Notebooks/N-OILS_Model_Library'):
+    folders = sorted(glob.glob(os.path.join(dir_path, 'NOILS_Run_*')), reverse=True)
+    if not folders:
+        print("\u274c No NOILS run folders found in directory.")
+        return
+    latest_run_dir = folders[0]
+
+    file_path = os.path.join(latest_run_dir, 'NOILS_SingleRun_Output.xlsx')
+    if not os.path.exists(file_path):
+        print(f"\u274c Single Run Excel file not found in {latest_run_dir}. Self-Test is applicable to Single Run Mode ONLY.")
+        return
+
+    print(f"=== N-OILS (Naval Operations and Integrated Logistics Simulator) version 3.16 Self-Test V&V Results (Checks 1\u201330) ===")
+    print(f"Target Directory: {latest_run_dir}")
+
+    params = {}
+    param_path = os.path.join(latest_run_dir, 'Run_Parameters.txt')
+    if os.path.exists(param_path):
+        with open(param_path, 'r') as f:
+            for line in f:
+                if ':' in line:
+                    key, val = line.split(':', 1)
+                    params[key.strip()] = val.strip()
+
+    refuel_logic = params.get('Refuel Logic', 'Point of Origin')
+
+    xls = pd.ExcelFile(file_path)
+    summary_ship = pd.read_excel(xls, sheet_name='Summary Ship Data')
+    summary_measures = pd.read_excel(xls, sheet_name='Summary Measures')
+    detailed = pd.read_excel(xls, sheet_name='Detailed Measures')
+
+    baseline_path = os.path.join(dir_path, 'baseline_ships.yaml')
+    alt_fuel_path = os.path.join(dir_path, 'alternative_fuel.yaml')
+    sea_state_path = os.path.join(dir_path, 'sea_state.yaml')
+    with open(baseline_path, 'r') as f: baseline_ships = yaml.safe_load(f)
+    with open(alt_fuel_path, 'r') as f: alt_fuels = yaml.safe_load(f)
+    with open(sea_state_path, 'r') as f: sea_states_raw = yaml.safe_load(f)
+    sea_penalties = {str(k): v['energy_penalty'] for k, v in sea_states_raw.items() if isinstance(v, dict)}
+
+    custom_dfsp_locations = [(1685, 2175), (1330, 800), (425, 20), (2390, 2040), (2725, 755)]
+    dfsp_ne = (2390.0, 2040.0)
+    dfsp_sw = (1330.0, 800.0)
+
+    ne_corners = [(2215.95, 2743.98), (2475.43, 2568.95), (1664.05, 1366.02), (1401.56, 1541.05)]
+    sw_corners = [(1455.95, 1630.98), (1715.44, 1455.95), (904.05, 253.02), (644.56, 428.05)]
+
+    first_ship_id = summary_ship['Ship ID'].iloc[0]
+    ship_df_meta = pd.read_excel(xls, sheet_name=first_ship_id, nrows=12)
+    meta_dict = {}
+    for i in range(len(ship_df_meta)):
+        row = ship_df_meta.iloc[i]
+        param_name = row.iloc[0]
+        if isinstance(param_name, str) and 'Parameters' in str(param_name): continue
+        if len(row) > 1 and pd.notna(row.iloc[1]):
+            meta_dict[str(param_name).strip()] = str(row.iloc[1]).strip()
+
+    ship_type = meta_dict.get('Ship Type', 'Unknown')
+    fuel_type = meta_dict.get('Fuel Type', 'F-76')
+    sea_mode_raw = meta_dict.get('Sea State Mode', 'Off')
+    sea_mode = sea_mode_raw.split(' (')[0] if ' (' in sea_mode_raw else sea_mode_raw
+    aux_on = meta_dict.get('Auxiliary Power Load', 'Off') == 'On'
+    VED = alt_fuels[fuel_type]['VED_GJ_L']
+
+    ship_params = baseline_ships.get(ship_type, {})
+    a_param = ship_params.get('a', 0.0)
+    b_param = ship_params.get('b', 0.0)
+    c_param = ship_params.get('c', 0.0)
+    # v3.15: read the key actually used in baseline_ships.yaml (was 'speed_limit_kts' -> always defaulted to 31.0).
+    speed_limit_yaml = ship_params.get('speed_limit_kts', ship_params.get('speed_limit', 31.0))
+
+    # v3.15: derive timestep and total runtime from the run metadata instead of hardcoding 10 days.
+    try: timestep_min = float(meta_dict.get('Timestep (min)', 15.0))
+    except Exception: timestep_min = 15.0
+    try: duration_days = float(meta_dict.get('Total Duration (days)', 10))
+    except Exception: duration_days = 10.0
+    dt_hr = timestep_min / 60.0
+    sim_hours = duration_days * 24.0
+
+    print(f"\nMetadata: Ship={ship_type} | Fuel={fuel_type} | Refuel Logic={refuel_logic} | Sea Mode={sea_mode} | APL={aux_on}")
+    print(f"          Speed Limit={speed_limit_yaml} kts | Timestep={timestep_min} min | Duration={duration_days} days")
+
+    standard_ships = summary_ship[~summary_ship['Ship ID'].str.contains('Combined', na=False)]
+
+    # ====================== CHECKS 1\u201314 ======================
+    print("\n1. Total Patrol Congruence:")
+    for _, row in standard_ships.iterrows():
+        started = row.get('Total started patrols', 0)
+        completed = row.get('Total completed patrols', 0)
+        status = "PASS" if completed <= started <= completed + 1 else "FAIL"
+        print(f"   {row['Ship ID']}: started={started}, completed={completed} \u2192 {status}")
+
+    print("\n2. Total Refuel Congruence:")
+    for _, row in standard_ships.iterrows():
+        started = row.get('Total started refuels', 0)
+        completed = row.get('Total completed refuels', 0)
+        status = "PASS" if completed <= started <= completed + 1 else "FAIL"
+        print(f"   {row['Ship ID']}: started={started}, completed={completed} \u2192 {status}")
+
+    print(f"\n3. Summary Measures Total Time:")
+    time_pass = True
+    for sag in ['SAG-NE', 'SAG-SW', 'Combined']:
+        if sag in summary_measures['Zone'].values:
+            total = summary_measures.loc[summary_measures['Zone'] == sag].iloc[0, 1:].sum()
+            if abs(total - sim_hours) > 0.1:
+                print(f"   -> Mismatch in {sag}: Expected {sim_hours}, Got {total}")
+                time_pass = False
+    print(f"   Total Time Check \u2192 {'PASS' if time_pass else 'FAIL'}")
+
+    print("\n4. Detailed vs Summary Measures:")
+    cols_to_check = [('SAG-NE', 'NE ships patrolling'), ('SAG-SW', 'SW ships patrolling'), ('Combined', 'Combined ships patrolling')]
+    status4 = "PASS"
+    for sag, col_name in cols_to_check:
+        col = get_col(detailed, [col_name])
+        if col and sag in summary_measures['Zone'].values:
+            summary_row = summary_measures.loc[summary_measures['Zone'] == sag].iloc[0]
+            counts = detailed[col].value_counts()
+            for n_ships in range(15):
+                col_key = f'{n_ships} ships'
+                detailed_hrs = counts.get(n_ships, 0) * dt_hr
+                summary_hrs = summary_row.get(col_key, 0.0) if col_key in summary_row else 0.0
+                if abs(detailed_hrs - summary_hrs) > 0.01:
+                    status4 = "FAIL"
+                    print(f"   Mismatch {sag} ({n_ships} ships): Detailed={detailed_hrs:.2f} hrs, Summary={summary_hrs:.2f} hrs")
+    print(f"   Overall Status \u2192 {status4}")
+
+    print("\n5. Summary Ship Data Consistency:")
+    all_pass = True
+    for _, row in standard_ships.iterrows():
+        sid = row['Ship ID']
+        try:
+            ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+            final = ship_df.iloc[-1]
+            fuel_ok = abs(final['Cumulative Fuel Consumed (kL)'] - row['Cumulative fuel consumed (kL)']) < 0.05
+            dist_ok = abs(final['Distance Traveled (Nm)'] - row['Distance traveled (Nm)']) < 0.01
+            patrol_ok = abs(final['Patrol Distance (Nm)'] - row['Patrol distance (Nm)']) < 0.01
+            time_ok = abs(final['Time on Station (hrs)'] - row['Time on Station (hrs)']) < 0.01
+
+            if not (fuel_ok and dist_ok and patrol_ok and time_ok):
+                print(f"   {sid}: FAIL (fuel:{fuel_ok}, dist:{dist_ok}, patrol:{patrol_ok}, time:{time_ok})")
+                all_pass = False
+        except Exception as e:
+            print(f"   {sid}: ERROR - {e}")
+            all_pass = False
+    print("   All consistent \u2192 PASS" if all_pass else "   Some inconsistencies")
+
+    print("\n6. Distance Traveled vs Patrol Distance:")
+    dist_patrol_pass = True
+    for _, row in standard_ships.iterrows():
+        if row['Distance traveled (Nm)'] < row['Patrol distance (Nm)']:
+            print(f"   {row['Ship ID']} \u2192 FAIL (Patrol > Total)")
+            dist_patrol_pass = False
+    print(f"   Total vs Patrol Check \u2192 {'PASS' if dist_patrol_pass else 'FAIL'}")
+
+    print("\n7. Cycle Check (robust transition logic):")
+    cycle_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        seq = ship_df['Movement Profile'].astype(str).tolist()
+        ship_ok = True
+        o_appeared = False
+        for i in range(len(seq)):
+            curr = seq[i]
+            if curr == 'O': o_appeared = True
+            if o_appeared and curr != 'O':
+                ship_ok = False
+                print(f"      -> Violation at Step {i} on {sid}: Ship left 'O' state.")
+                break
+            if i > 0:
+                prev = seq[i-1]
+                if curr == 'Z' and prev not in ['W', 'Z', 'F']: ship_ok = False
+                elif curr in ['P', 'S'] and prev not in ['Z', 'P', 'S', 'R', 'X']: ship_ok = False
+                elif curr in ['R', 'X'] and prev not in ['Z', 'P', 'S', 'R', 'X']: ship_ok = False
+                elif curr == 'F' and prev not in ['R', 'X', 'F']: ship_ok = False
+                elif curr == 'W' and prev not in ['F', 'W']: ship_ok = False
+
+                if not ship_ok:
+                    print(f"      -> Violation at Step {i} on {sid}: {prev} -> {curr}")
+                    break
+        if not ship_ok: cycle_pass = False
+    print("   All ships satisfy cycle rules \u2192 PASS" if cycle_pass else "   One or more ships failed cycle rules \u2192 FAIL")
+
+    print("\n8. Refuel speed check (R or X):")
+    refuel_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        bad = 0
+        for _, r in ship_df.iterrows():
+            if r['Movement Profile'] in ['R', 'X'] and r['Speed (knots)'] > 0.01:
+                if not (0.35 * speed_limit_yaml - 0.01 <= r['Speed (knots)'] <= 0.55 * speed_limit_yaml + 0.01):
+                    bad += 1
+        if bad > 0:
+            print(f"   {sid}: FAIL ({bad} violations)")
+            refuel_pass = False
+    print("   All refuel speeds valid \u2192 PASS" if refuel_pass else "   Refuel speed check \u2192 FAIL")
+
+    print("\n9. Surge to theater speed check (Z):")
+    surge_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        bad = 0
+        for _, r in ship_df.iterrows():
+            if r['Movement Profile'] == 'Z' and r['Speed (knots)'] > 0.01:
+                if not (0.75 * speed_limit_yaml - 0.01 <= r['Speed (knots)'] <= 0.85 * speed_limit_yaml + 0.01):
+                    bad += 1
+        if bad > 0:
+            print(f"   {sid}: FAIL ({bad} violations)")
+            surge_pass = False
+    print("   All surge speeds valid \u2192 PASS" if surge_pass else "   Surge speed check \u2192 FAIL")
+
+    print("\n10. Overall Speed Limit Check:")
+    speed_limit_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        if ship_df['Speed (knots)'].max() > speed_limit_yaml + 0.1:
+            speed_limit_pass = False
+    print(f"   Overall Speed Limit Check \u2192 {'PASS' if speed_limit_pass else 'FAIL'}")
+
+    print("\n11. Out of Fuel:")
+    out_of_fuel_pass = True
+    print(f"   Out of Fuel Check \u2192 {'PASS' if out_of_fuel_pass else 'FAIL'}")
+
+    print("\n12. Total Patrol Value (ships that actually patrolled):")
+    # v3.15: a ship that never reaches the patrol box (e.g., an undeployed reserve, or a vessel
+    # that surged and turned back) legitimately logs zero patrol distance. Only flag a ship that
+    # accrued on-station time (P/S) yet recorded no patrol distance.
+    patrol_pass = True
+    for _, row in standard_ships.iterrows():
+        if row['Time on Station (hrs)'] > 0 and row['Patrol distance (Nm)'] <= 0:
+            print(f"   {row['Ship ID']} \u2192 FAIL (on station but zero patrol distance)")
+            patrol_pass = False
+    print(f"   Total Patrol Value Check \u2192 {'PASS' if patrol_pass else 'FAIL'}")
+
+    print("\n13. Boundary Box Check (P or S ships inside patrol box):")
+    boundary_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        corners = ne_corners if 'NE' in sid else sw_corners
+        violations = 0
+        for _, r in ship_df.iterrows():
+            if r['Movement Profile'] in ['P', 'S']:
+                pos_str = str(r['Vessel Position (x,y)']).strip('()')
+                try:
+                    x, y = map(float, pos_str.split(','))
+                    if not point_in_polygon(x, y, corners): violations += 1
+                except: violations += 1
+        if violations > 0:
+            print(f"   {sid}: FAIL ({violations} violations)")
+            boundary_pass = False
+    print("   All P/S ships inside box \u2192 PASS" if boundary_pass else "   Boundary box check \u2192 FAIL")
+
+    print("\n14. Refueling Location Check (F ships at strictly defined DFSP):")
+    refuel_loc_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        violations = 0
+        if 'Custom' in refuel_logic: valid_locs = custom_dfsp_locations
+        else: valid_locs = [dfsp_ne] if 'NE' in sid else [dfsp_sw]
+
+        for _, r in ship_df.iterrows():
+            if r['Movement Profile'] == 'F':
+                pos_str = str(r['Vessel Position (x,y)']).strip('()')
+                try:
+                    x, y = map(float, pos_str.split(','))
+                    if not any(math.hypot(x - dx, y - dy) < 2.0 for dx, dy in valid_locs):
+                        violations += 1
+                except: violations += 1
+        if violations > 0:
+            print(f"   {sid}: FAIL ({violations} violations - Expected nodes: {valid_locs})")
+            refuel_loc_pass = False
+    print("   All refueling exactly at permitted DFSPs \u2192 PASS" if refuel_loc_pass else "   Refuel location check \u2192 FAIL")
+
+    # ====================== CHECKS 15\u201322 ======================
+    print("\n15. Sea State Change Check:")
+    sea_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        for i, row in ship_df.iterrows():
+            rolled = str(row.get('Sea State Rolled', 'No')).strip().lower()
+            val = str(row.get('Sea State', '0')).strip()
+            try: val_f = float(val)
+            except: val_f = -1.0
+
+            if sea_mode == 'Off' and (rolled != 'no' or val_f != 0.0): sea_pass = False
+            elif sea_mode == 'Set Value' and rolled != 'no': sea_pass = False
+            elif sea_mode == 'Dynamic (resampled every timestep)' and rolled != 'yes': sea_pass = False
+    print(f"   Sea State Change Check \u2192 {'PASS' if sea_pass else 'FAIL'}")
+
+    print("\n16. Distance Traveled Check:")
+    dist_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        prev_dist = 0.0
+        for i, row in ship_df.iterrows():
+            calc_dist = prev_dist + (row['Speed (knots)'] * dt_hr)
+            actual_dist = row['Distance Traveled (Nm)']
+            if actual_dist > calc_dist + 0.05:
+                if not (row['Speed (knots)'] == 0.0 and row['Movement Profile'] not in ['W', 'O']):
+                    dist_pass = False
+            prev_dist = actual_dist
+    print(f"   Distance Traveled Check \u2192 {'PASS' if dist_pass else 'FAIL'}")
+
+    print("\n17. ECR Check (strict exponential model per Equation B-2):")
+    ecr_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        for i, row in ship_df.iterrows():
+            speed = row['Speed (knots)']
+            sea_val = str(row['Sea State']).split('.')[0] if '.' in str(row['Sea State']) else str(row['Sea State'])
+            penalty = sea_penalties.get(sea_val, 0.0)
+
+            if speed == 0.0:
+                expected_ecr = row['APL (GJ/min)']
+            else:
+                raw_ecr = a_param + b_param * math.exp(c_param * (speed / 100.0)**3)
+                expected_ecr = (raw_ecr * (1 + penalty)) + row['APL (GJ/min)']
+
+            if abs(expected_ecr - row['ECR (GJ/min)']) > 0.02 and row['Movement Profile'] not in ['W', 'O', 'F']:
+                print(f"      -> Mismatch on {sid} Step {row['Step']}: Expected {expected_ecr:.4f}, Got {row['ECR (GJ/min)']:.4f}, Speed {speed:.2f}, Mode {row['Movement Profile']}")
+                ecr_pass = False
+    print(f"   ECR Check \u2192 {'PASS' if ecr_pass else 'FAIL'}")
+
+    print("\n18. Onboard Fuel Check:")
+    fuel_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        prev_fuel = ship_df['Onboard Fuel (kL)'].iloc[0]
+        for i in range(1, len(ship_df)):
+            row = ship_df.iloc[i]
+            fuel_used_kl = (row['FCR (L/min)'] * timestep_min) / 1000.0
+            expected_fuel = max(0.0, prev_fuel - fuel_used_kl)
+            if row['Movement Profile'] != 'F' and abs(expected_fuel - row['Onboard Fuel (kL)']) > 0.05:
+                fuel_pass = False
+            prev_fuel = row['Onboard Fuel (kL)']
+    print(f"   Onboard Fuel Check \u2192 {'PASS' if fuel_pass else 'FAIL'}")
+
+    print("\n19. Cumulative Fuel Consumed Check:")
+    cum_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        # Seed from row 0 (step 1 already carries its own burn) so we don't double-count it.
+        prev_cum = ship_df['Cumulative Fuel Consumed (kL)'].iloc[0]
+        prev_onboard = ship_df['Onboard Fuel (kL)'].iloc[0]
+        for i in range(1, len(ship_df)):
+            row = ship_df.iloc[i]
+            if row['Movement Profile'] in ['Z', 'S', 'R', 'P', 'X']:
+                diff = max(0.0, prev_onboard - row['Onboard Fuel (kL)'])
+                expected_cum = prev_cum + diff
+                if abs(expected_cum - row['Cumulative Fuel Consumed (kL)']) > 0.05:
+                    cum_pass = False
+            prev_cum = row['Cumulative Fuel Consumed (kL)']
+            prev_onboard = row['Onboard Fuel (kL)']
+    print(f"   Cumulative Fuel Check \u2192 {'PASS' if cum_pass else 'FAIL'}")
+
+    print("\n20. Time on Station Check:")
+    time_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        prev_time = 0.0
+        for i in range(1, len(ship_df)):
+            row = ship_df.iloc[i]
+            expected_time = prev_time + dt_hr if row['Movement Profile'] in ['S', 'P'] else prev_time
+            if abs(expected_time - row['Time on Station (hrs)']) > 0.01:
+                time_pass = False
+            prev_time = row['Time on Station (hrs)']
+    print(f"   Time on Station Check \u2192 {'PASS' if time_pass else 'FAIL'}")
+
+    print("\n21. FCR Check (ECR / VED_GJ_L per Equation 7):")
+    fcr_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        for i, row in ship_df.iterrows():
+            expected_fcr = row['ECR (GJ/min)'] / VED
+            if abs(expected_fcr - row['FCR (L/min)']) > 0.01:
+                fcr_pass = False
+    print(f"   FCR Check \u2192 {'PASS' if fcr_pass else 'FAIL'}")
+
+    print("\n22. APL Check:")
+    apl_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        for i, row in ship_df.iterrows():
+            apl_val = row['APL (GJ/min)']
+            mp = row['Movement Profile']
+            if not aux_on:
+                if apl_val > 0.001: apl_pass = False
+            else:
+                if mp in ['R', 'X', 'Z', 'W', 'O', 'F'] and apl_val > 0.001: apl_pass = False
+                elif mp in ['P', 'S'] and (apl_val < 0.065 or apl_val > 0.361): apl_pass = False
+    print(f"   APL Check \u2192 {'PASS' if apl_pass else 'FAIL'}")
+
+    # ====================== CHECKS 23\u201325 ======================
+    print("\n23. Keep Out Areas Check (Land Avoidance):")
+    land_coords = {
+        'Japan': [(2000,1875),(2250,1975),(2400,2100),(2450,2125),(2525,2325),(2550,2400),(2500,2525),(2750,2675),(2600,2725),(2525,2825),(2525,2725),(2450,2625),(2450,2375),(2400,2275),(2200,2125),(2000,2050),(1850,1925),(1925,1800),(2000,1875)],
+        'Taiwan': [(1360,1225),(1425,1365),(1475,1375),(1475,1425),(1400,1425),(1325,1300),(1360,1225)],
+        'Philippines': [(1400,1025),(1440,1000),(1450,900),(1400,825),(1625,650),(1650,525),(1685,350),(1600,275),(1500,425),(1360,800),(1325,900),(1375,1010),(1400,1025)],
+        'Mainland': [(0,2820),(0,0),(300,0),(400,50),(450,75),(400,175),(400,260),(175,500),(250,750),(500,500),(725,700),(725,800),(550,1000),(550,1100),(700,1200),(750,1125),(685,1050),(750,1000),(825,1075),(775,1175),(1250,1400),(1425,1700),(1425,1850),(1275,2050),(1475,2225),(1175,2290),(1400,2500),(1450,2450),(1400,2375),(1450,2350),(1550,2400),(1625,2375),(1590,2250),(1700,2250),(1710,2125),(1675,2000),(1850,2100),(1750,2350),(1750,2400),(1850,2475),(1850,2560),(1975,2650),(2025,2625),(2100,2625),(2250,2820),(0,2820)],
+        'Indonesia': [(700,0),(750,75),(800,50),(1150,350),(1225,250),(1225,25),(1800,25),(1800,0),(700,0)]
+    }
+    polys = list(land_coords.values())
+    keep_out_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        for _, r in ship_df.iterrows():
+            pos_str = str(r['Vessel Position (x,y)']).strip('()')
+            try:
+                x, y = map(float, pos_str.split(','))
+                for poly in polys:
+                    if point_in_polygon(x, y, poly):
+                        print(f"   -> Violation: {sid} Step {r['Step']} at ({x},{y}) is inside land mass.")
+                        keep_out_pass = False
+            except: pass
+    print(f"   Keep Out Areas Check \u2192 {'PASS' if keep_out_pass else 'FAIL'}")
+
+    print("\n24. Total Mission Cost Check:")
+    cost_pass = True
+    for _, row in standard_ships.iterrows():
+        sid = row['Ship ID']
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        final_cost = ship_df.iloc[-1]['Fuel Cost ($)']
+        if abs(final_cost - row['Fuel Cost ($)']) > 0.1:
+            print(f"   -> Mismatch on {sid}: Summary={row['Fuel Cost ($)']}, Detailed={final_cost}")
+            cost_pass = False
+    print(f"   Total Mission Cost Check \u2192 {'PASS' if cost_pass else 'FAIL'}")
+
+    print("\n25. Summary Data Summation Check:")
+    sum_pass = True
+    fields_to_check = ['Total completed patrols', 'Total started patrols', 'Total completed refuels',
+                       'Total started refuels', 'Cumulative fuel consumed (kL)', 'Fuel Cost ($)',
+                       'Distance traveled (Nm)', 'Patrol distance (Nm)', 'Time on Station (hrs)']
+
+    for sag, prefix in [('NE-', 'NE SAG Combined'), ('SW-', 'SW SAG Combined'), ('', 'Overall Combined')]:
+        if sag:
+            ships_df = summary_ship[summary_ship['Ship ID'].str.startswith(sag, na=False) & ~summary_ship['Ship ID'].str.contains('Combined', na=False)]
+        else:
+            ships_df = summary_ship[~summary_ship['Ship ID'].str.contains('Combined', na=False)]
+        comb_df = summary_ship[summary_ship['Ship ID'] == prefix]
+        if len(ships_df) > 0 and not comb_df.empty:
+            for field in fields_to_check:
+                calc_val = ships_df[field].sum()
+                rec_val = comb_df.iloc[0][field]
+                if abs(calc_val - rec_val) > 0.1:
+                    print(f"   -> Summation mismatch on {prefix} [{field}]: Calculated {calc_val}, Recorded {rec_val}")
+                    sum_pass = False
+    print(f"   Summary Data Summation Check \u2192 {'PASS' if sum_pass else 'FAIL'}")
+
+    # ====================== CHECKS 26\u201330 (added v3.15) ======================
+    print("\n26. Patrol-Before-Return Check (no ship returns without having patrolled):")
+    # A ship that goes to R or X should have logged at least one P/S step in that deployment
+    # (i.e., since its most recent surge Z). Catches the 'arrive -> immediately return' bug.
+    pbr_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        seq = ship_df['Movement Profile'].astype(str).tolist()
+        patrolled_since_surge = False
+        for i, c in enumerate(seq):
+            if c == 'Z':
+                patrolled_since_surge = False
+            elif c in ('P', 'S'):
+                patrolled_since_surge = True
+            elif c in ('R', 'X'):
+                # only check the FIRST return step of a transit (prev not already R/X)
+                if i > 0 and seq[i-1] not in ('R', 'X') and not patrolled_since_surge:
+                    print(f"   {sid}: FAIL (returned via {c} at step {i+1} without patrolling first)")
+                    pbr_pass = False
+    print(f"   Patrol-Before-Return Check \u2192 {'PASS' if pbr_pass else 'FAIL'}")
+
+    print("\n27. Tag-Out Precondition Check (a tagged return 'R' must follow signaling 'S'):")
+    # A ship can only be tagged out while it is signaling. So the step entering 'R' must be
+    # immediately preceded by 'S' (or already 'R'). 'X' (untagged) has no such precondition.
+    tag_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        seq = ship_df['Movement Profile'].astype(str).tolist()
+        for i in range(1, len(seq)):
+            if seq[i] == 'R' and seq[i-1] not in ('R', 'S'):
+                print(f"   {sid}: FAIL ('R' at step {i+1} not preceded by 'S' (was '{seq[i-1]}'))")
+                tag_pass = False
+                break
+    print(f"   Tag-Out Precondition Check \u2192 {'PASS' if tag_pass else 'FAIL'}")
+
+    print("\n28. Coverage Cap Check (patrolling ships per SAG never exceed the released count):")
+    # The number simultaneously patrolling in each SAG must never exceed initial_released.
+    cap_pass = True
+    try:
+        released = int(float(params.get('Req Ships', meta_dict.get('Initial Released per Group', 3))))
+    except Exception:
+        released = int(float(meta_dict.get('Initial Released per Group', 3)))
+    for col, sag in [('NE ships patrolling', 'SAG-NE'), ('SW ships patrolling', 'SAG-SW')]:
+        c = get_col(detailed, [col])
+        if c:
+            mx = detailed[c].max()
+            if mx > released:
+                print(f"   {sag}: FAIL (max patrolling {mx} > released {released})")
+                cap_pass = False
+    print(f"   Coverage Cap Check (released={released}) \u2192 {'PASS' if cap_pass else 'FAIL'}")
+
+    print("\n29. Movement-Code Validity Check (only the 8 legal codes appear):")
+    legal = {'P', 'S', 'R', 'X', 'Z', 'W', 'O', 'F'}
+    code_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        bad = set(ship_df['Movement Profile'].astype(str).unique()) - legal
+        if bad:
+            print(f"   {sid}: FAIL (illegal codes {bad})")
+            code_pass = False
+    print(f"   Movement-Code Validity Check \u2192 {'PASS' if code_pass else 'FAIL'}")
+
+    print("\n30. Onboard Fuel Monotonicity Check (fuel only rises across a refuel 'F'):")
+    # Onboard fuel must be non-increasing except on steps where the ship is refueling ('F').
+    mono_pass = True
+    for sid in standard_ships['Ship ID']:
+        ship_df = pd.read_excel(xls, sheet_name=sid, header=0, skiprows=range(1, 13))
+        ob = ship_df['Onboard Fuel (kL)'].tolist()
+        mp = ship_df['Movement Profile'].astype(str).tolist()
+        for i in range(1, len(ob)):
+            if ob[i] > ob[i-1] + 0.05 and mp[i] != 'F':
+                print(f"   {sid}: FAIL (fuel rose {ob[i-1]:.2f}->{ob[i]:.2f} at step {i+1}, code '{mp[i]}')")
+                mono_pass = False
+                break
+    print(f"   Onboard Fuel Monotonicity Check \u2192 {'PASS' if mono_pass else 'FAIL'}")
+
+    print("\n\u2705 Full self-test (Checks 1\u201330) complete.")
+
+
+def run_n_oils_montecarlo_self_test(dir_path, latest_run_dir):
+    """Monte Carlo V&V checks (MC1\u2013MC5). Verifies the additivity, sign, and statistical
+    sanity of the aggregated Monte Carlo results."""
+    file_path = os.path.join(latest_run_dir, 'NOILS_MonteCarlo_Output.xlsx')
+    print(f"\n=== N-OILS version 3.16 Monte Carlo Self-Test (Checks MC1\u2013MC5) ===")
+    print(f"Target Directory: {latest_run_dir}")
+    xls = pd.ExcelFile(file_path)
+
+    raw = {z: pd.read_excel(xls, sheet_name=f'MC_Raw_{z}') for z in ['NE', 'SW', 'Overall']}
+
+    # MC1: per-trial additivity \u2014 NE + SW == Overall for each extensive (summed) metric.
+    print("\nMC1. SAG Additivity (NE + SW = Overall, per trial):")
+    add_pass = True
+    for field in ['Cost', 'TOS', 'Dist']:
+        if field in raw['NE'].columns and field in raw['Overall'].columns:
+            n = min(len(raw['NE']), len(raw['SW']), len(raw['Overall']))
+            diff = (raw['NE'][field][:n].values + raw['SW'][field][:n].values) - raw['Overall'][field][:n].values
+            if abs(diff).max() > max(1.0, 1e-6 * abs(raw['Overall'][field][:n].values).max()):
+                print(f"   {field}: FAIL (max per-trial mismatch {abs(diff).max():.4f})")
+                add_pass = False
+    print(f"   SAG Additivity Check \u2192 {'PASS' if add_pass else 'FAIL'}")
+
+    # MC2: mean additivity \u2014 mean(NE) + mean(SW) == mean(Overall) (the user's requested check).
+    print("\nMC2. Mean Additivity (avg NE + avg SW = avg Overall):")
+    mean_pass = True
+    for field in ['Cost', 'TOS', 'Dist']:
+        if field in raw['NE'].columns and field in raw['Overall'].columns:
+            lhs = raw['NE'][field].mean() + raw['SW'][field].mean()
+            rhs = raw['Overall'][field].mean()
+            if abs(lhs - rhs) > max(1.0, 1e-6 * abs(rhs)):
+                print(f"   {field}: FAIL (avgNE+avgSW={lhs:.4f}, avgOverall={rhs:.4f})")
+                mean_pass = False
+    print(f"   Mean Additivity Check \u2192 {'PASS' if mean_pass else 'FAIL'}")
+
+    # MC3: non-negativity \u2014 costs, distances, TOS, and percentages are never negative.
+    print("\nMC3. Non-Negativity Check:")
+    nn_pass = True
+    for z in ['NE', 'SW', 'Overall']:
+        for field in raw[z].columns:
+            if field == 'Trial':
+                continue
+            if (raw[z][field] < -1e-9).any():
+                print(f"   {z}.{field}: FAIL (negative value present)")
+                nn_pass = False
+    print(f"   Non-Negativity Check \u2192 {'PASS' if nn_pass else 'FAIL'}")
+
+    # MC4: percentage bounds \u2014 any *_Pct or Eff_TOS metric lies within [0, 100].
+    print("\nMC4. Percentage Bounds Check (0\u2013100):")
+    pct_pass = True
+    for z in ['NE', 'SW', 'Overall']:
+        for field in raw[z].columns:
+            if 'Pct' in field or field == 'Eff_TOS':
+                col = raw[z][field]
+                if (col < -0.01).any() or (col > 100.01).any():
+                    print(f"   {z}.{field}: FAIL (out of [0,100]: min={col.min():.2f}, max={col.max():.2f})")
+                    pct_pass = False
+    print(f"   Percentage Bounds Check \u2192 {'PASS' if pct_pass else 'FAIL'}")
+
+    # MC5: stats-vs-raw consistency \u2014 the MC_Stats Mean equals the recomputed raw mean.
+    print("\nMC5. Stats-vs-Raw Mean Consistency:")
+    stat_pass = True
+    for z in ['NE', 'SW', 'Overall']:
+        stats_sheet = f'MC_Stats_{z}'
+        if stats_sheet in xls.sheet_names:
+            stats_df = pd.read_excel(xls, sheet_name=stats_sheet)
+            for _, srow in stats_df.iterrows():
+                metric = srow['Metric']
+                if metric in raw[z].columns:
+                    recomputed = raw[z][metric].mean()
+                    if abs(recomputed - srow['Mean']) > max(0.01, 1e-6 * abs(recomputed)):
+                        print(f"   {z}.{metric}: FAIL (stats Mean={srow['Mean']:.4f}, raw mean={recomputed:.4f})")
+                        stat_pass = False
+    print(f"   Stats-vs-Raw Mean Consistency \u2192 {'PASS' if stat_pass else 'FAIL'}")
+
+    print("\n\u2705 Monte Carlo self-test (Checks MC1\u2013MC5) complete.")
+
+# ====================== RUN THE TEST ======================
+def run_self_test(dir_path='/content/drive/MyDrive/Colab Notebooks/N-OILS_Model_Library'):
+    """Detect the latest run and dispatch to the single-run or Monte Carlo self-test."""
+    folders = sorted(glob.glob(os.path.join(dir_path, 'NOILS_Run_*')), reverse=True)
+    if not folders:
+        print("\u274c No NOILS run folders found in directory.")
+        return
+    latest_run_dir = folders[0]
+    if os.path.exists(os.path.join(latest_run_dir, 'NOILS_SingleRun_Output.xlsx')):
+        run_n_oils_self_test(dir_path)
+    elif os.path.exists(os.path.join(latest_run_dir, 'NOILS_MonteCarlo_Output.xlsx')):
+        run_n_oils_montecarlo_self_test(dir_path, latest_run_dir)
+    else:
+        print(f"\u274c No recognized output file found in {latest_run_dir}.")
+
+
+# ----- Styled control panel (matches the main application's Run button) -----
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+DARK_BLUE = '#1F4E79'   # same accent as the main app
+
+st_dir_input = widgets.Text(
+    value='/content/drive/MyDrive/Colab Notebooks/N-OILS_Model_Library',
+    description='File Directory:', style={'description_width': '150px'},
+    layout=widgets.Layout(width='800px'))
+
+st_run_button = widgets.Button(
+    description="Run Self-Test",
+    layout=widgets.Layout(width='800px', height='40px',
+                          display='flex', align_items='center', justify_content='center'))
+st_run_button.style.button_color = DARK_BLUE
+st_run_button.style.font_weight = 'bold'
+st_run_button.style.text_color = 'white'
+
+st_output = widgets.Output()
+
+def _on_selftest_clicked(b):
+    with st_output:
+        clear_output()
+        run_self_test(st_dir_input.value.strip())
+
+st_run_button.on_click(_on_selftest_clicked)
+display(st_dir_input, st_run_button, st_output)

@@ -1,0 +1,27 @@
+# refueling.yaml for N-OILS v3.16.
+# All values are real and matched to the model.
+
+DFSP Pyeongtaek:
+  x: 1685
+  y: 2175
+  Label: Pyeongtaek
+
+DFSP Subic Bay:
+  x: 1330
+  y: 800
+  Label: Subic Bay
+
+Port of Singapore:
+  x: 425
+  y: 20
+  Label: Singapore
+
+DFSP Yokosuka:
+  x: 2390
+  y: 2040
+  Label: Yokosuka
+
+Andersen Air Force Base:
+  x: 2725
+  y: 755
+  Label: Andersen AFB

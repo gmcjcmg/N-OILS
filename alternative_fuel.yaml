@@ -1,0 +1,53 @@
+# alternative_fuel.yaml for N-OILS v3.16.
+# All values are real except for cost.
+# Cost is a placeholder value at $1 per Liter.
+
+F-76:
+  density_kg_L: 0.876
+  VED_GJ_L: 0.0375
+  Cost_$_L: 1.000
+
+JP-5:
+  density_kg_L: 0.8165
+  VED_GJ_L: 0.0426
+  Cost_$_L: 1.000
+
+Ammonia:
+  density_kg_L: 0.682
+  VED_GJ_L: 0.0127
+  Cost_$_L: 1.000
+
+LNG:
+  density_kg_L: 0.470
+  VED_GJ_L: 0.02125
+  Cost_$_L: 1.000
+
+Hydrogen_Liquid:
+  density_kg_L: 0.0708
+  VED_GJ_L: 0.0708
+  Cost_$_L: 1.000
+
+Hydrogen_Compressed:
+  density_kg_L: 0.0235
+  VED_GJ_L: 0.0235
+  Cost_$_L: 1.000
+
+Methanol:
+  density_kg_L: 0.791
+  VED_GJ_L: 0.022
+  Cost_$_L: 1.000
+
+Ethanol:
+  density_kg_L: 0.794
+  VED_GJ_L: 0.02835
+  Cost_$_L: 1.000
+
+HRD_HVO:
+  density_kg_L: 0.7825
+  VED_GJ_L: 0.0344
+  Cost_$_L: 1.000
+
+FAME:
+  density_kg_L: 0.884
+  VED_GJ_L: 0.03305
+  Cost_$_L: 1.000
